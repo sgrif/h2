@@ -128,8 +128,8 @@ impl Handle {
     }
 
     /// Read the client preface
-    pub async fn read_preface(self) -> Result<Self, io::Error> {
-        let buf = vec![0; PREFACE.len()];
+    pub async fn read_preface(mut self) -> Result<Self, io::Error> {
+        let mut buf = vec![0; PREFACE.len()];
         self.read_exact(&mut buf).await?;
         assert_eq!(buf, PREFACE);
         Ok(self)
@@ -223,21 +223,21 @@ impl Handle {
             panic!("unexpected frame; frame={:?}", frame);
         };
 
-        let (frame, _me) = me.into_future().await;
+        let (frame, me) = me.into_future().await;
 
         let f = assert_settings!(frame.unwrap().unwrap());
 
         // Is ACK
         assert!(f.is_ack());
 
-        (settings, self)
+        (settings, me)
     }
 }
 
 impl Stream for Handle {
     type Item = Result<Frame, RecvError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let codec = Pin::new(&mut self.codec);
         codec.poll_next(cx)
     }
@@ -245,7 +245,7 @@ impl Stream for Handle {
 
 impl AsyncRead for Handle {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
@@ -257,7 +257,7 @@ impl AsyncRead for Handle {
 
 impl AsyncWrite for Handle {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
         src: &[u8],
     ) -> Poll<io::Result<usize>> {
@@ -267,7 +267,7 @@ impl AsyncWrite for Handle {
     }
 
     fn poll_flush(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<io::Result<()>> {
         let pipe = self.pipe();
@@ -276,7 +276,7 @@ impl AsyncWrite for Handle {
     }
 
     fn poll_close(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<io::Result<()>> {
         let pipe = self.pipe();
@@ -308,7 +308,7 @@ impl Mock {
 
 impl AsyncRead for Mock {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
@@ -318,7 +318,7 @@ impl AsyncRead for Mock {
 
 impl AsyncWrite for Mock {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
         src: &[u8],
     ) -> Poll<io::Result<usize>> {
@@ -326,14 +326,14 @@ impl AsyncWrite for Mock {
     }
 
     fn poll_flush(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<io::Result<()>> {
         self.pipe().poll_flush(cx)
     }
 
     fn poll_close(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<io::Result<()>> {
         self.pipe().poll_close(cx)
@@ -385,7 +385,7 @@ impl AsyncRead for Pipe {
 impl AsyncWrite for Pipe {
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context,
+        _: &mut Context,
         src: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut me = self.inner.lock().unwrap();
@@ -398,11 +398,11 @@ impl AsyncWrite for Pipe {
         Poll::Ready(Ok(src.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -472,14 +472,14 @@ pub trait HandleFutureExt {
         Self: Future<Output = Handle> + Sized + 'static,
     {
         let data = data.to_owned();
-        Box::new(self.then(|mut handle| {
-            handle.pipe()
-                .write_all(&data)
-                .map(|r| {
-                    r.unwrap_or_else(|e| panic!("write err={:?}", e));
-                    handle
-                })
-        }))
+        Box::new(async move {
+            let mut handle = self.await;
+            let mut pipe = handle.pipe();
+            pipe.write_all(&data)
+                .await
+                .unwrap_or_else(|e| panic!("write err={:?}", e));
+            handle
+        })
     }
 
     fn ping_pong(self, payload: [u8; 8]) -> RecvFrame<<SendFrameFut<Self> as IntoRecvFrame>::Future>
@@ -519,29 +519,28 @@ pub trait HandleFutureExt {
     where
         Self: Future<Output = Handle> + Sized + 'static,
     {
-        use futures::future::poll_fn;
-        Box::new(self.then(|mut handle| {
+        Box::new(async move {
+            let mut handle = self.await;
             {
                 let mut i = handle.codec.get_ref().get_ref().get_ref().inner.lock().unwrap();
                 i.tx_rem = num;
             }
 
-            poll_fn(|cx| {
-                let mut inner = handle
-                    .pipe()
+            loop {
+                let pipe = handle.pipe();
+                let mut inner = pipe
                     .inner
                     .lock()
                     .unwrap();
 
                 if inner.tx_rem == 0 {
                     inner.tx_rem = usize::MAX;
-                    Poll::Ready(handle)
+                    return handle;
                 } else {
-                    inner.tx_task = Some(cx.waker().clone());
-                    Poll::Pending
+                    inner.tx_task = Some(GetWaker.await);
                 }
-            })
-        }))
+            }
+        })
     }
 
     fn unbounded_bytes(self) -> Box<dyn Future<Output = Handle>>
@@ -601,10 +600,10 @@ where
 {
     type Output = Handle;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         use self::Frame::Data;
 
-        let (frame, handle) = ready!(self.inner().poll(cx));
+        let (frame, handle) = ready!(self.as_mut().inner().poll(cx));
 
         match (frame, &self.frame) {
             (Some(Data(ref a)), &Some(Data(ref b))) => {
@@ -629,6 +628,8 @@ pub struct SendFrameFut<T> {
 impl<T> SendFrameFut<T> {
     // safe: There is no drop impl, and we don't move `future` from `poll`
     unsafe_pinned!(inner: T);
+    // safe: We never create a pin to this field, and don't create self-references
+    unsafe_unpinned!(frame: Option<SendFrame>);
 }
 
 impl<T> Future for SendFrameFut<T>
@@ -637,9 +638,9 @@ where
 {
     type Output = Handle;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let mut handle = ready!(self.inner().poll(cx));
-        handle.send(self.frame.take().unwrap()).unwrap();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let mut handle = ready!(self.as_mut().inner().poll(cx));
+        handle.send(self.frame().take().unwrap()).unwrap();
         Poll::Ready(handle)
     }
 }
@@ -652,7 +653,7 @@ pub struct Idle {
 impl Future for Idle {
     type Output = Handle;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         if self.timeout.poll_unpin(cx).is_ready() {
             return Poll::Ready(self.handle.take().unwrap());
         }
@@ -701,5 +702,15 @@ where
             inner: into_fut,
             frame: frame,
         }
+    }
+}
+
+struct GetWaker;
+
+impl Future for GetWaker {
+    type Output = Waker;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        Poll::Ready(cx.waker().clone())
     }
 }

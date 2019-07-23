@@ -82,10 +82,10 @@ where
         use futures01::Future;
         use futures::executor::block_on;
 
-        let connection_future = future::poll_fn(|_| {
+        let mut connection_future = future::poll_fn(|_| {
             util::poll_01_to_03(self.poll())
         }).fuse();
-        let f = f.fuse();
+        let mut f = f.fuse();
         block_on(async {
             loop {
                 select! {

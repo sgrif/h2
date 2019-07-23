@@ -198,41 +198,6 @@ impl Handle {
     }
 }
 
-impl Mock {
-    fn sync_read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        use std::thread;
-
-        loop {
-            match self.inner.read(dst) {
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if let Some(rem) = self.inner.remaining_wait() {
-                        thread::sleep(rem);
-                    } else {
-                        // We've entered a dead lock scenario. The peer expects
-                        // a write but we are reading.
-                        panic!("mock_io::Mock expects write but currently blocked in read");
-                    }
-                }
-                ret => return ret,
-            }
-        }
-    }
-
-    fn sync_write(&mut self, src: &[u8]) -> io::Result<usize> {
-        match self.inner.write(src) {
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                panic!("mock_io::Mock not currently expecting a write");
-            }
-            ret => ret,
-        }
-    }
-
-    /// Returns `true` if running in a futures-rs task context
-    fn is_async(&self) -> bool {
-        self.r#async.unwrap_or(false)
-    }
-}
-
 impl Inner {
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         match self.action() {
@@ -439,13 +404,13 @@ mod tokio {
 
     impl AsyncRead for Mock {
         fn poll_read(
-            self: Pin<&mut Self>,
+            mut self: Pin<&mut Self>,
             cx: &mut Context,
             dst: &mut [u8],
         ) -> Poll<io::Result<usize>> {
             loop {
                 if let Some(ref mut sleep) = self.tokio.sleep {
-                    let res = ready!(sleep.poll_unpin(cx));
+                    ready!(sleep.poll_unpin(cx))?;
                 }
 
                 // If a sleep is set, it has already fired
@@ -477,13 +442,13 @@ mod tokio {
 
     impl AsyncWrite for Mock {
         fn poll_write(
-            self: Pin<&mut Mock>,
+            mut self: Pin<&mut Mock>,
             cx: &mut Context,
             src: &[u8],
         ) -> Poll<io::Result<usize>> {
             loop {
                 if let Some(ref mut sleep) = self.tokio.sleep {
-                    ready!(sleep.poll_unpin(cx));
+                    ready!(sleep.poll_unpin(cx))?;
                 }
 
                 // If a sleep is set, it has already fired
@@ -519,11 +484,11 @@ mod tokio {
             }
         }
 
-        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }

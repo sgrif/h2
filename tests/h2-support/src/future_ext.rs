@@ -163,8 +163,10 @@ where
 {
     type Output = Item;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        self.inner().poll(cx)
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        self.as_mut()
+            .inner()
+            .poll(cx)
             .map(|r| r.expect(&self.msg))
     }
 }
@@ -191,8 +193,10 @@ where
 {
     type Output = Error;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        self.inner().poll(cx)
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        self.as_mut()
+            .inner()
+            .poll(cx)
             .map(|r| r.expect_err(&self.msg))
     }
 }
@@ -211,6 +215,8 @@ pub struct Drive<T, U> {
 impl<T, U> Drive<T, U> {
     // safe: There is no drop impl, and we don't move `future` from `poll`
     unsafe_pinned!(future: U);
+    // safe: We require the field be `Unpin` in `poll`
+    unsafe_unpinned!(driver: Option<T>);
 }
 
 impl<T, U> Future for Drive<T, U>
@@ -220,21 +226,21 @@ where
 {
     type Output = (T, U::Output);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let mut looped = false;
 
         loop {
-            match self.future().poll(cx) {
+            match self.as_mut().future().poll(cx) {
                 Poll::Ready(val) => {
                     // Get the driver
-                    let driver = self.driver.take().unwrap();
+                    let driver = self.as_mut().driver().take().unwrap();
 
                     return (driver, val).into();
                 },
                 Poll::Pending => {},
             }
 
-            if self.driver.as_mut().unwrap().poll_unpin(cx).is_ready() {
+            if self.as_mut().driver().as_mut().unwrap().poll_unpin(cx).is_ready() {
                 if looped {
                     // Try polling the future one last time
                     panic!("driver resolved before future")
