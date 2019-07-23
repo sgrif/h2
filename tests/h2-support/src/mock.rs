@@ -1,18 +1,24 @@
-use crate::{frames, FutureExt, SendFrame};
+use crate::{frames, SendFrame};
 
 use h2::{self, RecvError, SendError};
 use h2::frame::{self, Frame};
 
-use futures::{Async, Future, Poll, Stream};
-use futures::sync::oneshot;
-use futures::task::{self, Task};
+use futures::prelude::*;
+use futures::channel::oneshot;
+use futures::task::*;
+use futures::compat::*;
+use futures::executor::block_on;
 
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::io::read_exact;
+use pin_utils::*;
 
-use std::{cmp, fmt, io, usize};
-use std::io::ErrorKind::WouldBlock;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::{cmp, io, usize};
+
+type CompatCodec = Compat01As03Sink<
+    crate::Codec<Compat<Pipe>>,
+    Frame<::std::io::Cursor<::bytes::Bytes>>,
+>;
 
 /// A mock I/O
 #[derive(Debug)]
@@ -22,10 +28,10 @@ pub struct Mock {
 
 #[derive(Debug)]
 pub struct Handle {
-    codec: crate::Codec<Pipe>,
+    codec: CompatCodec
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Pipe {
     inner: Arc<Mutex<Inner>>,
 }
@@ -36,19 +42,19 @@ struct Inner {
     rx: Vec<u8>,
 
     /// Notify when data is ready to be received.
-    rx_task: Option<Task>,
+    rx_task: Option<Waker>,
 
     /// Data written by the `h2` library to be read by the test case.
     tx: Vec<u8>,
 
     /// Notify when data is written. This notifies the test case waiters.
-    tx_task: Option<Task>,
+    tx_task: Option<Waker>,
 
     /// Number of bytes that can be written before `write` returns `NotReady`.
     tx_rem: usize,
 
     /// Task to notify when write capacity becomes available.
-    tx_rem_task: Option<Task>,
+    tx_rem_task: Option<Waker>,
 
     /// True when the pipe is closed.
     closed: bool,
@@ -80,9 +86,9 @@ pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
     };
 
     let handle = Handle {
-        codec: h2::Codec::new(Pipe {
+        codec: Compat01As03Sink::new(h2::Codec::new(Compat::new(Pipe {
             inner,
-        }),
+        }))),
     };
 
     (mock, handle)
@@ -91,53 +97,57 @@ pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
 // ===== impl Handle =====
 
 impl Handle {
-    /// Get a mutable reference to inner Codec.
-    pub fn codec_mut(&mut self) -> &mut crate::Codec<Pipe> {
+    // FIXME: This should return Pin<&mut Pipe>, but that's impossible
+    // while we still have layers of `Compat` in between
+    fn pipe(&mut self) -> Pipe {
+        self.codec.get_ref().get_ref().get_ref().clone()
+    }
+
+    /// Get a pinned mutable reference to inner Codec.
+    pub fn codec_mut(&mut self) -> &mut CompatCodec {
         &mut self.codec
     }
 
     /// Send a frame
     pub fn send(&mut self, item: SendFrame) -> Result<(), SendError> {
-        // Queue the frame
-        self.codec.buffer(item).unwrap();
+        block_on(async {
+            // Queue the frame
+            self.codec.send(item).await?;
 
-        // Flush the frame
-        assert!(self.codec.flush()?.is_ready());
+            // Flush the frame
+            self.codec.flush().await?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Writes the client preface
     pub fn write_preface(&mut self) {
-        use std::io::Write;
-
         // Write the connnection preface
-        self.codec.get_mut().write(PREFACE).unwrap();
+        block_on(self.pipe().write_all(PREFACE)).unwrap();
     }
 
     /// Read the client preface
-    pub fn read_preface(self) -> Box<dyn Future<Item = Self, Error = io::Error>> {
+    pub async fn read_preface(self) -> Result<Self, io::Error> {
         let buf = vec![0; PREFACE.len()];
-        let ret = read_exact(self, buf).and_then(|(me, buf)| {
-            assert_eq!(buf, PREFACE);
-            Ok(me)
-        });
-
-        Box::new(ret)
+        self.read_exact(&mut buf).await?;
+        assert_eq!(buf, PREFACE);
+        Ok(self)
     }
 
     /// Perform the H2 handshake
-    pub fn assert_client_handshake(
+    pub async fn assert_client_handshake(
         self,
-    ) -> Box<dyn Future<Item = (frame::Settings, Self), Error = h2::Error>> {
+    ) -> (frame::Settings, Self) {
         self.assert_client_handshake_with_settings(frame::Settings::default())
+            .await
     }
 
     /// Perform the H2 handshake
-    pub fn assert_client_handshake_with_settings<T>(
+    pub async fn assert_client_handshake_with_settings<T>(
         mut self,
         settings: T,
-    ) -> Box<dyn Future<Item = (frame::Settings, Self), Error = h2::Error>>
+    ) -> (frame::Settings, Self)
     where
         T: Into<frame::Settings>,
     {
@@ -145,59 +155,50 @@ impl Handle {
         // Send a settings frame
         self.send(settings.into()).unwrap();
 
-        let ret = self.read_preface()
-            .unwrap()
-            .and_then(|me| me.into_future().unwrap())
-            .map(|(frame, mut me)| {
-                match frame {
-                    Some(Frame::Settings(settings)) => {
-                        // Send the ACK
-                        let ack = frame::Settings::ack();
+        let me = self.read_preface()
+            .await
+            .unwrap();
+        let (frame, mut me) = me
+            .into_future()
+            .await;
+        let frame = frame.unwrap_or_else(|| panic!("unexpected EOF"))
+            .unwrap();
+        let settings = if let Frame::Settings(settings) = frame {
+            // Send the ACK
+            let ack = frame::Settings::ack();
 
-                        // TODO: Don't unwrap?
-                        me.send(ack.into()).unwrap();
+            // TODO: Don't unwrap?
+            me.send(ack.into()).unwrap();
 
-                        (settings, me)
-                    },
-                    Some(frame) => {
-                        panic!("unexpected frame; frame={:?}", frame);
-                    },
-                    None => {
-                        panic!("unexpected EOF");
-                    },
-                }
-            })
-            .then(|res| {
-                let (settings, me) = res.unwrap();
+            settings
+        } else {
+            panic!("unexpected frame; frame={:?}", frame);
+        };
+        let (frame, me) = me.into_future()
+            .await;
 
-                me.into_future()
-                    .map_err(|_| unreachable!("all previous futures unwrapped"))
-                    .map(|(frame, me)| {
-                        let f = assert_settings!(frame.unwrap());
+        let f = assert_settings!(frame.unwrap().unwrap());
 
-                        // Is ACK
-                        assert!(f.is_ack());
+        // Is ACK
+        assert!(f.is_ack());
 
-                        (settings, me)
-                    })
-            });
-
-        Box::new(ret)
+        (settings, me)
     }
 
 
     /// Perform the H2 handshake
-    pub fn assert_server_handshake(
+    pub async fn assert_server_handshake(
         self,
-    ) -> Box<dyn Future<Item = (frame::Settings, Self), Error = h2::Error>> {
+    ) -> (frame::Settings, Self) {
         self.assert_server_handshake_with_settings(frame::Settings::default())
+            .await
     }
 
     /// Perform the H2 handshake
-    pub fn assert_server_handshake_with_settings<T>(
+    pub async fn assert_server_handshake_with_settings<T>(
         mut self,
         settings: T,
-    ) -> Box<dyn Future<Item = (frame::Settings, Self), Error = h2::Error>>
+    ) -> (frame::Settings, Self)
     where
         T: Into<frame::Settings>,
     {
@@ -206,161 +207,136 @@ impl Handle {
         let settings = settings.into();
         self.send(settings.into()).unwrap();
 
-        let ret = self.into_future()
-            .unwrap()
-            .map(|(frame, mut me)| {
-                match frame {
-                    Some(Frame::Settings(settings)) => {
-                        // Send the ACK
-                        let ack = frame::Settings::ack();
+        let (frame, mut me) = self.into_future().await;
+        let frame = frame.unwrap_or_else(|| panic!("unexpected EOF"))
+            .unwrap();
 
-                        // TODO: Don't unwrap?
-                        me.send(ack.into()).unwrap();
+        let settings = if let Frame::Settings(settings) = frame {
+            // Send the ACK
+            let ack = frame::Settings::ack();
 
-                        (settings, me)
-                    },
-                    Some(frame) => {
-                        panic!("unexpected frame; frame={:?}", frame);
-                    },
-                    None => {
-                        panic!("unexpected EOF");
-                    },
-                }
-            })
-            .then(|res| {
-                let (settings, me) = res.unwrap();
+            // TODO: Don't unwrap?
+            me.send(ack.into()).unwrap();
 
-                me.into_future()
-                    .map_err(|e| panic!("error: {:?}", e))
-                    .map(|(frame, me)| {
-                        let f = assert_settings!(frame.unwrap());
+            settings
+        } else {
+            panic!("unexpected frame; frame={:?}", frame);
+        };
 
-                        // Is ACK
-                        assert!(f.is_ack());
+        let (frame, _me) = me.into_future().await;
 
-                        (settings, me)
-                    })
-            });
+        let f = assert_settings!(frame.unwrap().unwrap());
 
-        Box::new(ret)
+        // Is ACK
+        assert!(f.is_ack());
+
+        (settings, self)
     }
 }
 
 impl Stream for Handle {
-    type Item = Frame;
-    type Error = RecvError;
+    type Item = Result<Frame, RecvError>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, RecvError> {
-        self.codec.poll()
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let codec = Pin::new(&mut self.codec);
+        codec.poll_next(cx)
     }
 }
 
-impl io::Read for Handle {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.codec.get_mut().read(buf)
-    }
-}
-
-impl AsyncRead for Handle {}
-
-impl io::Write for Handle {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.codec.get_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+impl AsyncRead for Handle {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let pipe = self.pipe();
+        pin_mut!(pipe);
+        pipe.poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for Handle {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        use std::io::Write;
-        tokio_io::try_nb!(self.flush());
-        Ok(().into())
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        src: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let pipe = self.pipe();
+        pin_mut!(pipe);
+        pipe.poll_write(cx, src)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<io::Result<()>> {
+        let pipe = self.pipe();
+        pin_mut!(pipe);
+        pipe.poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<io::Result<()>> {
+        let pipe = self.pipe();
+        pin_mut!(pipe);
+        pipe.poll_close(cx)
     }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        assert!(self.codec.shutdown().unwrap().is_ready());
+        block_on(self.codec.close()).unwrap();
 
-        let mut me = self.codec.get_mut().inner.lock().unwrap();
+        let mut me = self.codec.get_ref().get_ref().get_ref().inner.lock().unwrap();
         me.closed = true;
 
         if let Some(task) = me.rx_task.take() {
-            task.notify();
+            task.wake();
         }
     }
 }
 
 // ===== impl Mock =====
 
-impl io::Read for Mock {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        assert!(
-            buf.len() > 0,
-            "attempted read with zero length buffer... wut?"
-        );
-
-        let mut me = self.pipe.inner.lock().unwrap();
-
-        if me.rx.is_empty() {
-            if me.closed {
-                return Ok(0);
-            }
-
-            me.rx_task = Some(task::current());
-            return Err(WouldBlock.into());
-        }
-
-        let n = cmp::min(buf.len(), me.rx.len());
-        buf[..n].copy_from_slice(&me.rx[..n]);
-        me.rx.drain(..n);
-
-        Ok(n)
+impl Mock {
+    fn pipe(&mut self) -> Pin<&mut Pipe> {
+        Pin::new(&mut self.pipe)
     }
 }
 
-impl AsyncRead for Mock {}
-
-impl io::Write for Mock {
-    fn write(&mut self, mut buf: &[u8]) -> io::Result<usize> {
-        let mut me = self.pipe.inner.lock().unwrap();
-
-        if me.closed {
-            return Ok(buf.len());
-        }
-
-        if me.tx_rem == 0 {
-            me.tx_rem_task = Some(task::current());
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-
-        if buf.len() > me.tx_rem {
-            buf = &buf[..me.tx_rem];
-        }
-
-        me.tx.extend(buf);
-        me.tx_rem -= buf.len();
-
-        if let Some(task) = me.tx_task.take() {
-            task.notify();
-        }
-
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+impl AsyncRead for Mock {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.pipe().poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for Mock {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        use std::io::Write;
-        tokio_io::try_nb!(self.flush());
-        Ok(().into())
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        src: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.pipe().poll_write(cx, src)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<io::Result<()>> {
+        self.pipe().poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<io::Result<()>> {
+        self.pipe().poll_close(cx)
     }
 }
 
@@ -370,15 +346,19 @@ impl Drop for Mock {
         me.closed = true;
 
         if let Some(task) = me.tx_task.take() {
-            task.notify();
+            task.wake();
         }
     }
 }
 
 // ===== impl Pipe =====
 
-impl io::Read for Pipe {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+impl AsyncRead for Pipe {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         assert!(
             buf.len() > 0,
             "attempted read with zero length buffer... wut?"
@@ -386,89 +366,79 @@ impl io::Read for Pipe {
 
         let mut me = self.inner.lock().unwrap();
 
-
         if me.tx.is_empty() {
             if me.closed {
-                return Ok(0);
+                return Poll::Ready(Ok(0));
             }
-
-            me.tx_task = Some(task::current());
-            return Err(WouldBlock.into());
+            me.tx_task = Some(cx.waker().clone());
+            return Poll::Pending;
         }
 
         let n = cmp::min(buf.len(), me.tx.len());
         buf[..n].copy_from_slice(&me.tx[..n]);
         me.tx.drain(..n);
 
-        Ok(n)
-    }
-}
-
-impl AsyncRead for Pipe {}
-
-impl io::Write for Pipe {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut me = self.inner.lock().unwrap();
-        me.rx.extend(buf);
-
-        if let Some(task) = me.rx_task.take() {
-            task.notify();
-        }
-
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        Poll::Ready(Ok(n))
     }
 }
 
 impl AsyncWrite for Pipe {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        use std::io::Write;
-        tokio_io::try_nb!(self.flush());
-        Ok(().into())
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        src: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut me = self.inner.lock().unwrap();
+        me.rx.extend(src);
+
+        if let Some(task) = me.rx_task.take() {
+            task.wake();
+        }
+
+        Poll::Ready(Ok(src.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
 pub trait HandleFutureExt {
     fn recv_settings(self)
-        -> RecvFrame<Box<dyn Future<Item = (Option<Frame>, Handle), Error = ()>>>
+        -> RecvFrame<Box<dyn Future<Output = (Option<Frame>, Handle)>>>
     where
         Self: Sized + 'static,
-        Self: Future<Item = (frame::Settings, Handle)>,
-        Self::Error: fmt::Debug,
+        Self: Future<Output = (frame::Settings, Handle)>,
     {
         self.recv_custom_settings(frame::Settings::default())
     }
 
     fn recv_custom_settings<T>(self, settings: T)
-        -> RecvFrame<Box<dyn Future<Item = (Option<Frame>, Handle), Error = ()>>>
+        -> RecvFrame<Box<dyn Future<Output = (Option<Frame>, Handle)>>>
     where
         Self: Sized + 'static,
-        Self: Future<Item = (frame::Settings, Handle)>,
-        Self::Error: fmt::Debug,
+        Self: Future<Output = (frame::Settings, Handle)>,
         T: Into<frame::Settings>,
     {
         let map = self
-            .map(|(settings, handle)| (Some(settings.into()), handle))
-            .unwrap();
+            .map(|(settings, handle)| (Some(settings.into()), handle));
 
-        let boxed: Box<dyn Future<Item = (Option<Frame>, Handle), Error = ()>> =
-            Box::new(map);
         RecvFrame {
-            inner: boxed,
+            inner: Box::new(map),
             frame: Some(settings.into().into()),
         }
     }
 
-    fn ignore_settings(self) -> Box<dyn Future<Item = Handle, Error = ()>>
+    fn ignore_settings(self) -> Box<dyn Future<Output = Handle>>
     where
         Self: Sized + 'static,
-        Self: Future<Item = (frame::Settings, Handle)>,
-        Self::Error: fmt::Debug,
+        Self: Future<Output = (frame::Settings, Handle)>,
     {
-        Box::new(self.map(|(_settings, handle)| handle).unwrap())
+        Box::new(self.map(|(_settings, handle)| handle))
     }
 
     fn recv_frame<T>(self, frame: T) -> RecvFrame<<Self as IntoRecvFrame>::Future>
@@ -497,56 +467,39 @@ pub trait HandleFutureExt {
         }
     }
 
-    fn send_bytes(self, data: &[u8]) -> Box<dyn Future<Item = Handle, Error = Self::Error>>
+    fn send_bytes(self, data: &[u8]) -> Box<dyn Future<Output = Handle>>
     where
-        Self: Future<Item = Handle> + Sized + 'static,
-        Self::Error: fmt::Debug,
+        Self: Future<Output = Handle> + Sized + 'static,
     {
-        use bytes::Buf;
-        use futures::future::poll_fn;
-        use std::io::Cursor;
-
-        let buf: Vec<_> = data.into();
-        let mut buf = Cursor::new(buf);
-
-        Box::new(self.and_then(move |handle| {
-            let mut handle = Some(handle);
-
-            poll_fn(move || {
-                while buf.has_remaining() {
-                    let res = handle.as_mut().unwrap()
-                        .codec.get_mut()
-                        .write_buf(&mut buf)
-                        .map_err(|e| panic!("write err={:?}", e));
-
-                    futures::try_ready!(res);
-                }
-
-                Ok(handle.take().unwrap().into())
-            })
+        let data = data.to_owned();
+        Box::new(self.then(|mut handle| {
+            handle.pipe()
+                .write_all(&data)
+                .map(|r| {
+                    r.unwrap_or_else(|e| panic!("write err={:?}", e));
+                    handle
+                })
         }))
     }
 
     fn ping_pong(self, payload: [u8; 8]) -> RecvFrame<<SendFrameFut<Self> as IntoRecvFrame>::Future>
     where
-        Self: Future<Item=Handle> + Sized + 'static,
-        Self::Error: fmt::Debug,
+        Self: Sized,
+        SendFrameFut<Self>: HandleFutureExt + IntoRecvFrame,
     {
         self.send_frame(frames::ping(payload))
             .recv_frame(frames::ping(payload).pong())
     }
 
-    fn idle_ms(self, ms: usize) -> Box<dyn Future<Item = Handle, Error = Self::Error>>
+    fn idle_ms(self, ms: usize) -> Box<dyn Future<Output = Handle>>
     where
         Self: Sized + 'static,
-        Self: Future<Item = Handle>,
-        Self::Error: fmt::Debug,
+        Self: Future<Output = Handle>,
     {
         use std::thread;
         use std::time::Duration;
 
-
-        Box::new(self.and_then(move |handle| {
+        Box::new(self.then(move |handle| {
             // This is terrible... but oh well
             let (tx, rx) = oneshot::channel();
 
@@ -558,112 +511,100 @@ pub trait HandleFutureExt {
             Idle {
                 handle: Some(handle),
                 timeout: rx,
-            }.map_err(|_| unreachable!())
+            }
         }))
     }
 
-    fn buffer_bytes(self, num: usize) -> Box<dyn Future<Item = Handle, Error = Self::Error>>
-    where Self: Sized + 'static,
-          Self: Future<Item = Handle>,
-          Self::Error: fmt::Debug,
+    fn buffer_bytes(self, num: usize) -> Box<dyn Future<Output = Handle>>
+    where
+        Self: Future<Output = Handle> + Sized + 'static,
     {
         use futures::future::poll_fn;
-
-        Box::new(self.and_then(move |mut handle| {
-            // Set tx_rem to num
+        Box::new(self.then(|mut handle| {
             {
-                let mut i = handle.codec.get_mut().inner.lock().unwrap();
+                let mut i = handle.codec.get_ref().get_ref().get_ref().inner.lock().unwrap();
                 i.tx_rem = num;
             }
 
-            let mut handle = Some(handle);
+            poll_fn(|cx| {
+                let mut inner = handle
+                    .pipe()
+                    .inner
+                    .lock()
+                    .unwrap();
 
-            poll_fn(move || {
-                {
-                    let mut inner = handle.as_mut().unwrap()
-                        .codec.get_mut().inner.lock().unwrap();
-
-                    if inner.tx_rem == 0 {
-                        inner.tx_rem = usize::MAX;
-                    } else {
-                        inner.tx_task = Some(task::current());
-                        return Ok(Async::NotReady);
-                    }
+                if inner.tx_rem == 0 {
+                    inner.tx_rem = usize::MAX;
+                    Poll::Ready(handle)
+                } else {
+                    inner.tx_task = Some(cx.waker().clone());
+                    Poll::Pending
                 }
-
-                Ok(handle.take().unwrap().into())
             })
         }))
     }
 
-    fn unbounded_bytes(self) -> Box<dyn Future<Item = Handle, Error = Self::Error>>
-    where Self: Sized + 'static,
-          Self: Future<Item = Handle>,
-          Self::Error: fmt::Debug,
+    fn unbounded_bytes(self) -> Box<dyn Future<Output = Handle>>
+    where
+        Self: Future<Output = Handle> + Sized + 'static,
     {
-        Box::new(self.and_then(|mut handle| {
-            {
-                let mut i = handle.codec.get_mut().inner.lock().unwrap();
-                i.tx_rem = usize::MAX;
+        Box::new(self.inspect(|handle| {
+            let mut i = handle.codec.get_ref().get_ref().get_ref().inner.lock().unwrap();
+            i.tx_rem = usize::MAX;
 
-                if let Some(task) = i.tx_rem_task.take() {
-                    task.notify();
-                }
+            if let Some(task) = i.tx_rem_task.take() {
+                task.wake();
             }
-
-            Ok(handle.into())
         }))
     }
 
-    fn then_notify(self, tx: oneshot::Sender<()>) -> Box<dyn Future<Item = Handle, Error = Self::Error>>
-    where Self: Sized + 'static,
-          Self: Future<Item = Handle>,
-          Self::Error: fmt::Debug,
+    fn then_notify(self, tx: oneshot::Sender<()>) -> Box<dyn Future<Output = Self::Output>>
+    where
+        Self: Future + Sized + 'static,
     {
-        Box::new(self.map(move |handle| {
+        Box::new(self.inspect(move |_| {
             tx.send(()).unwrap();
-            handle
         }))
     }
 
-    fn wait_for<F>(self, other: F) -> Box<dyn Future<Item = Self::Item, Error = Self::Error>>
+    fn wait_for<F>(self, other: F) -> Box<dyn Future<Output = Self::Output>>
     where
         F: Future + 'static,
         Self: Future + Sized + 'static
     {
-        Box::new(self.then(move |result| {
-            other.then(move |_| result)
-        }))
+        use futures::future::join;
+        Box::new(join(self, other).map(|(left, _right)| left))
     }
 
-    fn close(self) -> Box<dyn Future<Item = (), Error = ()>>
+    fn close(self) -> Box<dyn Future<Output = ()>>
     where
-        Self: Future<Error = ()> + Sized + 'static,
+        Self: Future + Sized + 'static,
     {
         Box::new(self.map(drop))
     }
 }
 
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct RecvFrame<T> {
     inner: T,
     frame: Option<Frame>,
 }
 
+impl<T> RecvFrame<T> {
+    // safe: There is no drop impl, and we don't move `future` from `poll`
+    unsafe_pinned!(inner: T);
+}
+
 impl<T> Future for RecvFrame<T>
 where
-    T: Future<Item = (Option<Frame>, Handle)>,
-    T::Error: fmt::Debug,
+    T: Future<Output = (Option<Frame>, Handle)>,
 {
-    type Item = Handle;
-    type Error = ();
+    type Output = Handle;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         use self::Frame::Data;
 
-        let (frame, handle) = match self.inner.poll().unwrap() {
-            Async::Ready((frame, handle)) => (frame, handle),
-            Async::NotReady => return Ok(Async::NotReady),
-        };
+        let (frame, handle) = ready!(self.inner().poll(cx));
 
         match (frame, &self.frame) {
             (Some(Data(ref a)), &Some(Data(ref b))) => {
@@ -675,30 +616,31 @@ where
             }
         }
 
-        Ok(Async::Ready(handle))
+        Poll::Ready(handle)
     }
 }
 
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SendFrameFut<T> {
     inner: T,
     frame: Option<SendFrame>,
 }
 
+impl<T> SendFrameFut<T> {
+    // safe: There is no drop impl, and we don't move `future` from `poll`
+    unsafe_pinned!(inner: T);
+}
+
 impl<T> Future for SendFrameFut<T>
 where
-    T: Future<Item = Handle>,
-    T::Error: fmt::Debug,
+    T: Future<Output = Handle>,
 {
-    type Item = Handle;
-    type Error = ();
+    type Output = Handle;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let mut handle = match self.inner.poll().unwrap() {
-            Async::Ready(handle) => handle,
-            Async::NotReady => return Ok(Async::NotReady),
-        };
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let mut handle = ready!(self.inner().poll(cx));
         handle.send(self.frame.take().unwrap()).unwrap();
-        Ok(Async::Ready(handle))
+        Poll::Ready(handle)
     }
 }
 
@@ -708,20 +650,16 @@ pub struct Idle {
 }
 
 impl Future for Idle {
-    type Item = Handle;
-    type Error = ();
+    type Output = Handle;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if self.timeout.poll().unwrap().is_ready() {
-            return Ok(self.handle.take().unwrap().into());
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        if self.timeout.poll_unpin(cx).is_ready() {
+            return Poll::Ready(self.handle.take().unwrap());
         }
 
-        match self.handle.as_mut().unwrap().poll() {
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            res => {
-                panic!("Idle received unexpected frame on handle; frame={:?}", res);
-            },
-        }
+        self.handle.as_mut().unwrap().poll_next_unpin(cx).map(|res| {
+            panic!("Idle received unexpected frame on handle; frame={:?}", res);
+        })
     }
 }
 
@@ -749,16 +687,16 @@ impl IntoRecvFrame for Handle {
 
 impl<T> IntoRecvFrame for T
 where
-    T: Future<Item = Handle> + 'static,
-    T::Error: fmt::Debug,
+    T: Future<Output = Handle> + Send + 'static,
 {
-    type Future = Box<dyn Future<Item = (Option<Frame>, Handle), Error = ()>>;
+    type Future = Pin<Box<dyn Future<Output = (Option<Frame>, Handle)>>>;
 
     fn into_recv_frame(self, frame: Option<Frame>) -> RecvFrame<Self::Future> {
-        let into_fut = Box::new(
-            self.unwrap()
-                .and_then(|handle| handle.into_future().unwrap()),
-        );
+        let into_fut = async {
+            let mut handle = self.await;
+            let frame = handle.try_next().await.unwrap();
+            (frame, handle)
+        }.boxed();
         RecvFrame {
             inner: into_fut,
             frame: frame,

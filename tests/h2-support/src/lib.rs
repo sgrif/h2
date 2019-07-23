@@ -1,4 +1,5 @@
 //! Utilities to support tests.
+#![feature(async_await)]
 
 #[macro_use]
 pub mod assert;

@@ -31,10 +31,10 @@ pub use {bytes, env_logger, futures, http, tokio_io};
 pub use super::mock_io;
 
 // Re-export primary future types
-pub use futures::{Future, IntoFuture, Sink, Stream};
+pub use futures::prelude::*;
 
 // And our Future extensions
-pub use super::future_ext::{FutureExt, Unwrap};
+pub use super::future_ext::{FutureExt as _, Unwrap};
 
 // Our client_ext helpers
 pub use super::client_ext::{SendRequestExt};
@@ -69,7 +69,7 @@ impl MockH2 for super::mock_io::Builder {
 }
 
 pub trait ClientExt {
-    fn run<F: Future>(&mut self, f: F) -> Result<F::Item, F::Error>;
+    fn run<F: Future + Unpin>(&mut self, f: F) -> F::Output;
 }
 
 impl<T, B> ClientExt for client::Connection<T, B>
@@ -77,21 +77,23 @@ where
     T: AsyncRead + AsyncWrite + 'static,
     B: IntoBuf + 'static,
 {
-    fn run<F: Future>(&mut self, f: F) -> Result<F::Item, F::Error> {
-        use futures::future;
-        use futures::future::Either::*;
+    // FIXME: There must be a proper way to do this...
+    fn run<F: Future + Unpin>(&mut self, f: F) -> F::Output {
+        use futures01::Future;
+        use futures::executor::block_on;
 
-        let res = future::poll_fn(|| self.poll()).select2(f).wait();
-
-        match res {
-            Ok(A((_, b))) => {
-                // Connection is done...
-                b.wait()
-            },
-            Ok(B((v, _))) => return Ok(v),
-            Err(A((e, _))) => panic!("err: {:?}", e),
-            Err(B((e, _))) => return Err(e),
-        }
+        let connection_future = future::poll_fn(|_| {
+            util::poll_01_to_03(self.poll())
+        }).fuse();
+        let f = f.fuse();
+        block_on(async {
+            loop {
+                select! {
+                    conn_res = connection_future => conn_res.unwrap(),
+                    v = f => break v,
+                }
+            }
+        })
     }
 }
 

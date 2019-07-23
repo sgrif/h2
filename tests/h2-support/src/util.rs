@@ -1,24 +1,17 @@
 use h2;
 
-use string::{String, TryFrom};
+use futures::prelude::*;
+use super::string::{String, TryFrom};
 use bytes::Bytes;
-use futures::{Async, Future, Poll};
+use std::task::*;
+use std::pin::Pin;
 
 pub fn byte_str(s: &str) -> String<Bytes> {
     String::try_from(Bytes::from(s)).unwrap()
 }
 
-pub fn yield_once() -> impl Future<Item=(), Error=()> {
-    let mut yielded = false;
-    futures::future::poll_fn(move || {
-        if yielded {
-            Ok(Async::Ready(()))
-        } else {
-            yielded = true;
-            futures::task::current().notify();
-            Ok(Async::NotReady)
-        }
-    })
+pub async fn yield_once() {
+    futures::pending!();
 }
 
 pub fn wait_for_capacity(stream: h2::SendStream<Bytes>, target: usize) -> WaitForCapacity {
@@ -40,18 +33,26 @@ impl WaitForCapacity {
 }
 
 impl Future for WaitForCapacity {
-    type Item = h2::SendStream<Bytes>;
-    type Error = ();
+    type Output = h2::SendStream<Bytes>;
 
-    fn poll(&mut self) -> Poll<Self::Item, ()> {
-        let _ = futures::try_ready!(self.stream().poll_capacity().map_err(|_| panic!()));
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        ready!(poll_01_to_03(self.stream().poll_capacity()))
+            .unwrap();
 
         let act = self.stream().capacity();
 
         if act >= self.target {
-            return Ok(self.stream.take().unwrap().into());
+            Poll::Ready(self.stream.take().unwrap())
+        } else {
+            Poll::Pending
         }
+    }
+}
 
-        Ok(Async::NotReady)
+pub(crate) fn poll_01_to_03<T, E>(old: futures01::Poll<T, E>) -> Poll<Result<T, E>> {
+    match old {
+        Ok(futures01::Async::Ready(x)) => Poll::Ready(Ok(x)),
+        Ok(futures01::Async::NotReady) => Poll::Pending,
+        Err(e) => Poll::Ready(Err(e)),
     }
 }
