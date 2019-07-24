@@ -6,6 +6,7 @@ use h2::frame::{self, Frame};
 use futures::channel::oneshot;
 use futures::compat::*;
 use futures::executor::block_on;
+use futures::lock::Mutex;
 use futures::prelude::*;
 use futures::ready;
 use futures::task::*;
@@ -13,7 +14,7 @@ use futures::task::*;
 use pin_utils::*;
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{cmp, io, usize};
 
 type CompatCodec = Compat01As03Sink<
@@ -208,7 +209,7 @@ impl Handle {
         let settings = settings.into();
         self.send(settings.into()).unwrap();
 
-        let (frame, mut me) = self.into_future().await;
+        let frame = self.next().await;
         let frame = frame.unwrap_or_else(|| panic!("unexpected EOF"))
             .unwrap();
 
@@ -217,21 +218,21 @@ impl Handle {
             let ack = frame::Settings::ack();
 
             // TODO: Don't unwrap?
-            me.send(ack.into()).unwrap();
+            self.send(ack.into()).unwrap();
 
             settings
         } else {
             panic!("unexpected frame; frame={:?}", frame);
         };
 
-        let (frame, me) = me.into_future().await;
+        let frame = self.next().await;
 
         let f = assert_settings!(frame.unwrap().unwrap());
 
         // Is ACK
         assert!(f.is_ack());
 
-        (settings, me)
+        (settings, self)
     }
 }
 
@@ -290,7 +291,7 @@ impl Drop for Handle {
     fn drop(&mut self) {
         block_on(self.codec.close()).unwrap();
 
-        let mut me = self.codec.get_ref().get_ref().get_ref().inner.lock().unwrap();
+        let mut me = self.codec.get_ref().get_ref().get_ref().inner.try_lock().unwrap();
         me.closed = true;
 
         if let Some(task) = me.rx_task.take() {
@@ -301,49 +302,85 @@ impl Drop for Handle {
 
 // ===== impl Mock =====
 
-impl Mock {
-    fn pipe(&mut self) -> Pin<&mut Pipe> {
-        Pin::new(&mut self.pipe)
-    }
-}
-
 impl AsyncRead for Mock {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        self.pipe().poll_read(cx, buf)
+        assert!(
+            buf.len() > 0,
+            "attempted read with zero length buffer... wut?"
+        );
+
+        let mut me = self.pipe.inner.try_lock().unwrap();
+
+        if me.rx.is_empty() {
+            if me.closed {
+                return Poll::Ready(Ok(0));
+            }
+
+            me.rx_task = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+
+        let n = cmp::min(buf.len(), me.rx.len());
+        buf[..n].copy_from_slice(&me.rx[..n]);
+        me.rx.drain(..n);
+
+        Poll::Ready(Ok(n))
     }
 }
 
 impl AsyncWrite for Mock {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context,
-        src: &[u8],
+        mut src: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.pipe().poll_write(cx, src)
+        let mut me = self.pipe.inner.try_lock().unwrap();
+
+        if me.closed {
+            return Poll::Ready(Ok(src.len()));
+        }
+
+        if me.tx_rem == 0 {
+            me.tx_rem_task = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+
+        if src.len() > me.tx_rem {
+            src = &src[..me.tx_rem];
+        }
+
+        me.tx.extend(src);
+        me.tx_rem -= src.len();
+
+        if let Some(task) = me.tx_task.take() {
+            task.wake();
+        }
+
+        Poll::Ready(Ok(src.len()))
     }
 
     fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context,
+        self: Pin<&mut Self>,
+        _: &mut Context,
     ) -> Poll<io::Result<()>> {
-        self.pipe().poll_flush(cx)
+        Poll::Ready(Ok(()))
     }
 
     fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context,
+        self: Pin<&mut Self>,
+        _: &mut Context,
     ) -> Poll<io::Result<()>> {
-        self.pipe().poll_close(cx)
+        Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for Mock {
     fn drop(&mut self) {
-        let mut me = self.pipe.inner.lock().unwrap();
+        let mut me = self.pipe.inner.try_lock().unwrap();
         me.closed = true;
 
         if let Some(task) = me.tx_task.take() {
@@ -365,7 +402,7 @@ impl AsyncRead for Pipe {
             "attempted read with zero length buffer... wut?"
         );
 
-        let mut me = self.inner.lock().unwrap();
+        let mut me = self.inner.try_lock().unwrap();
 
         if me.tx.is_empty() {
             if me.closed {
@@ -389,7 +426,7 @@ impl AsyncWrite for Pipe {
         _: &mut Context,
         src: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut me = self.inner.lock().unwrap();
+        let mut me = self.inner.try_lock().unwrap();
         me.rx.extend(src);
 
         if let Some(task) = me.rx_task.take() {
@@ -410,36 +447,37 @@ impl AsyncWrite for Pipe {
 
 pub trait HandleFutureExt {
     fn recv_settings(self)
-        -> RecvFrame<Box<dyn Future<Output = (Option<Frame>, Handle)>>>
+        -> RecvFrame<Pin<Box<dyn Future<Output = (Option<Frame>, Handle)> + Send>>>
     where
-        Self: Sized + 'static,
+        Self: Send + Sized + 'static,
         Self: Future<Output = (frame::Settings, Handle)>,
     {
         self.recv_custom_settings(frame::Settings::default())
     }
 
     fn recv_custom_settings<T>(self, settings: T)
-        -> RecvFrame<Box<dyn Future<Output = (Option<Frame>, Handle)>>>
+        -> RecvFrame<Pin<Box<dyn Future<Output = (Option<Frame>, Handle)> + Send>>>
     where
-        Self: Sized + 'static,
+        Self: Send + Sized + 'static,
         Self: Future<Output = (frame::Settings, Handle)>,
         T: Into<frame::Settings>,
     {
         let map = self
-            .map(|(settings, handle)| (Some(settings.into()), handle));
+            .map(|(settings, handle)| (Some(settings.into()), handle))
+            .boxed();
 
         RecvFrame {
-            inner: Box::new(map),
+            inner: map,
             frame: Some(settings.into().into()),
         }
     }
 
-    fn ignore_settings(self) -> Box<dyn Future<Output = Handle>>
+    fn ignore_settings(self) -> Pin<Box<dyn Future<Output = Handle> + Send>>
     where
-        Self: Sized + 'static,
+        Self: Send + Sized + 'static,
         Self: Future<Output = (frame::Settings, Handle)>,
     {
-        Box::new(self.map(|(_settings, handle)| handle))
+        self.map(|(_settings, handle)| handle).boxed()
     }
 
     fn recv_frame<T>(self, frame: T) -> RecvFrame<<Self as IntoRecvFrame>::Future>
@@ -468,19 +506,19 @@ pub trait HandleFutureExt {
         }
     }
 
-    fn send_bytes(self, data: &[u8]) -> Box<dyn Future<Output = Handle>>
+    fn send_bytes(self, data: &[u8]) -> Pin<Box<dyn Future<Output = Handle> + Send>>
     where
-        Self: Future<Output = Handle> + Sized + 'static,
+        Self: Future<Output = Handle> + Send + Sized + 'static,
     {
         let data = data.to_owned();
-        Box::new(async move {
+        async move {
             let mut handle = self.await;
             let mut pipe = handle.pipe();
             pipe.write_all(&data)
                 .await
                 .unwrap_or_else(|e| panic!("write err={:?}", e));
             handle
-        })
+        }.boxed()
     }
 
     fn ping_pong(self, payload: [u8; 8]) -> RecvFrame<<SendFrameFut<Self> as IntoRecvFrame>::Future>
@@ -492,15 +530,15 @@ pub trait HandleFutureExt {
             .recv_frame(frames::ping(payload).pong())
     }
 
-    fn idle_ms(self, ms: usize) -> Box<dyn Future<Output = Handle>>
+    fn idle_ms(self, ms: usize) -> Pin<Box<dyn Future<Output = Handle> + Send>>
     where
-        Self: Sized + 'static,
+        Self: Send + Sized + 'static,
         Self: Future<Output = Handle>,
     {
         use std::thread;
         use std::time::Duration;
 
-        Box::new(self.then(move |handle| {
+        self.then(move |handle| {
             // This is terrible... but oh well
             let (tx, rx) = oneshot::channel();
 
@@ -513,17 +551,17 @@ pub trait HandleFutureExt {
                 handle: Some(handle),
                 timeout: rx,
             }
-        }))
+        }).boxed()
     }
 
-    fn buffer_bytes(self, num: usize) -> Box<dyn Future<Output = Handle>>
+    fn buffer_bytes(self, num: usize) -> Pin<Box<dyn Future<Output = Handle> + Send>>
     where
-        Self: Future<Output = Handle> + Sized + 'static,
+        Self: Future<Output = Handle> + Send + Sized + 'static,
     {
-        Box::new(async move {
+        async move {
             let mut handle = self.await;
             {
-                let mut i = handle.codec.get_ref().get_ref().get_ref().inner.lock().unwrap();
+                let mut i = handle.codec.get_ref().get_ref().get_ref().inner.lock().await;
                 i.tx_rem = num;
             }
 
@@ -532,7 +570,7 @@ pub trait HandleFutureExt {
                 let mut inner = pipe
                     .inner
                     .lock()
-                    .unwrap();
+                    .await;
 
                 if inner.tx_rem == 0 {
                     inner.tx_rem = usize::MAX;
@@ -541,46 +579,52 @@ pub trait HandleFutureExt {
                     inner.tx_task = Some(GetWaker.await);
                 }
             }
-        })
+        }.boxed()
     }
 
-    fn unbounded_bytes(self) -> Box<dyn Future<Output = Handle>>
+    fn unbounded_bytes(self) -> Pin<Box<dyn Future<Output = Handle> + Send>>
     where
-        Self: Future<Output = Handle> + Sized + 'static,
+        Self: Future<Output = Handle> + Send + Sized + 'static,
     {
-        Box::new(self.inspect(|handle| {
-            let mut i = handle.codec.get_ref().get_ref().get_ref().inner.lock().unwrap();
-            i.tx_rem = usize::MAX;
+        async {
+            let handle = self.await;
+            {
+                let mut i = handle.codec.get_ref().get_ref().get_ref().inner.lock().await;
+                i.tx_rem = usize::MAX;
 
-            if let Some(task) = i.tx_rem_task.take() {
-                task.wake();
+                if let Some(task) = i.tx_rem_task.take() {
+                    task.wake();
+                }
             }
-        }))
+            handle
+        }.boxed()
     }
 
-    fn then_notify(self, tx: oneshot::Sender<()>) -> Box<dyn Future<Output = Self::Output>>
+    fn then_notify(self, tx: oneshot::Sender<()>) -> Pin<Box<dyn Future<Output = Self::Output> + Send>>
     where
-        Self: Future + Sized + 'static,
+        Self: Future + Send + Sized + 'static,
     {
-        Box::new(self.inspect(move |_| {
+        self.inspect(move |_| {
             tx.send(()).unwrap();
-        }))
+        }).boxed()
     }
 
-    fn wait_for<F>(self, other: F) -> Box<dyn Future<Output = Self::Output>>
+    fn wait_for<F>(self, other: F) -> Pin<Box<dyn Future<Output = Self::Output> + Send>>
     where
-        F: Future + 'static,
-        Self: Future + Sized + 'static
+        F: Future + Send + 'static,
+        F::Output: Send,
+        Self: Future + Send + Sized + 'static,
+        Self::Output: Send,
     {
         use futures::future::join;
-        Box::new(join(self, other).map(|(left, _right)| left))
+        join(self, other).map(|(left, _right)| left).boxed()
     }
 
-    fn close(self) -> Box<dyn Future<Output = ()>>
+    fn close(self) -> Pin<Box<dyn Future<Output = ()> + Send>>
     where
-        Self: Future + Sized + 'static,
+        Self: Future + Send + Sized + 'static,
     {
-        Box::new(self.map(drop))
+        self.map(drop).boxed()
     }
 }
 
@@ -691,7 +735,7 @@ impl<T> IntoRecvFrame for T
 where
     T: Future<Output = Handle> + Send + 'static,
 {
-    type Future = Pin<Box<dyn Future<Output = (Option<Frame>, Handle)>>>;
+    type Future = Pin<Box<dyn Future<Output = (Option<Frame>, Handle)> + Send>>;
 
     fn into_recv_frame(self, frame: Option<Frame>) -> RecvFrame<Self::Future> {
         let into_fut = async {
