@@ -274,6 +274,13 @@ pub struct SendResponse<B: IntoBuf> {
     inner: proto::StreamRef<B::Buf>,
 }
 
+#[allow(missing_debug_implementations)]
+#[must_use = "streams do nothing unless polled"]
+/// Future for [`SendResponse::client_reset`]
+pub struct SendResponseClientReset<'a, B: IntoBuf> {
+    send_response: &'a mut SendResponse<B>,
+}
+
 /// Stages of an in-progress handshake.
 enum Handshaking<T, B: IntoBuf> {
     /// State 1. Connection is flushing pending SETTINGS frame.
@@ -282,6 +289,17 @@ enum Handshaking<T, B: IntoBuf> {
     ReadingPreface(ReadPreface<T, Prioritized<B::Buf>>),
     /// Dummy state for `mem::replace`.
     Empty,
+}
+
+/// The future for [`close`](Connection::close)
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+#[allow(missing_debug_implementations)]
+pub struct Close<'a, A, B>
+where
+    A: AsyncRead + AsyncWrite,
+    B: IntoBuf,
+{
+    connection: &'a mut Connection<A, B>,
 }
 
 /// Flush a Sink
@@ -414,7 +432,7 @@ where
     #[deprecated(note="use abrupt_shutdown or graceful_shutdown instead", since="0.1.4")]
     #[doc(hidden)]
     pub fn close_connection(&mut self) {
-        self.graceful_shutdown();
+        let _ = self.graceful_shutdown();
     }
 
     /// Sets the connection to a GOAWAY state.
@@ -429,8 +447,9 @@ where
     /// handled.
     ///
     /// For graceful shutdowns, see [`graceful_shutdown`](Connection::graceful_shutdown).
-    pub fn abrupt_shutdown(&mut self, reason: Reason) {
+    pub fn abrupt_shutdown(&mut self, reason: Reason) -> Close<'_, T, B>{
         self.connection.go_away_from_user(reason);
+        self.close()
     }
 
     /// Starts a [graceful shutdown][1] process.
@@ -443,8 +462,9 @@ where
     /// have completed, the connection is closed.
     ///
     /// [1]: http://httpwg.org/specs/rfc7540.html#GOAWAY
-    pub fn graceful_shutdown(&mut self) {
+    pub fn graceful_shutdown(&mut self) -> Close<'_, T, B> {
         self.connection.go_away_gracefully();
+        self.close()
     }
 
     /// Takes a `PingPong` instance from the connection.
@@ -456,6 +476,23 @@ where
         self.connection
             .take_user_pings()
             .map(PingPong::new)
+    }
+
+    /// Returns a future that resolves when the underlying connection has closed.
+    ///
+    /// Note that this function will not result in the connection closing
+    /// earlier than it would otherwise, nor is the future guaranteed to
+    /// resolve without additional work.
+    ///
+    /// To send a `GO_AWAY` frame, see [`abrupt_shutdown`](Connection::abrupt_shutdown)
+    /// or [`graceful_shutdown`](Connection::graceful_shutdown).
+    ///
+    /// For the future to resolve, any open or incoming streams must be handled.
+    /// See [`poll_close`](Connection::poll_close) for more details
+    pub fn close(&mut self) -> Close<'_, T, B> {
+        Close {
+            connection: self,
+        }
     }
 }
 
@@ -963,6 +1000,15 @@ impl<B: IntoBuf> SendResponse<B> {
         self.inner.poll_reset(proto::PollReset::AwaitingHeaders)
     }
 
+    /// Returns a future that resolves when the client resets this stream.
+    ///
+    /// See [`poll_reset`](Self::poll_reset) for details.
+    pub fn client_reset(&mut self) -> SendResponseClientReset<'_, B> {
+        SendResponseClientReset {
+            send_response: self,
+        }
+    }
+
     /// Returns the stream ID of the response stream.
     ///
     /// # Panics
@@ -1313,5 +1359,34 @@ where
 {
     #[inline] fn from(codec: Codec<T, Prioritized<B::Buf>>) -> Self {
         Handshaking::from(Flush::new(codec))
+    }
+}
+
+// ===== impl Close =====
+
+impl<'a, A, B> Future for Close<'a, A, B>
+where
+    A: AsyncRead + AsyncWrite,
+    B: IntoBuf,
+{
+    type Item = ();
+    type Error = crate::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.connection.poll_close()
+    }
+}
+
+// ===== impl SendResponseClientReset =====
+
+impl<'a, B> Future for SendResponseClientReset<'a, B>
+where
+    B: IntoBuf,
+{
+    type Item = Reason;
+    type Error = crate::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.send_response.poll_reset()
     }
 }

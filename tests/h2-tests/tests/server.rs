@@ -1,12 +1,17 @@
 #![deny(warnings)]
+#![allow(unused_mut)] // FIXME: Remove once std::future port is finished
+#![feature(async_await)]
 
 use h2_support::prelude::*;
+use futures::compat::*;
+use futures::{join, try_join};
+use futures::prelude::*;
 
 const SETTINGS: &'static [u8] = &[0, 0, 0, 4, 0, 0, 0, 0, 0];
 const SETTINGS_ACK: &'static [u8] = &[0, 0, 0, 4, 1, 0, 0, 0, 0];
 
-#[test]
-fn read_preface_in_multiple_frames() {
+#[runtime::test]
+async fn read_preface_in_multiple_frames() {
     let _ = env_logger::try_init();
 
     let mock = mock_io::Builder::new()
@@ -17,23 +22,28 @@ fn read_preface_in_multiple_frames() {
         .write(SETTINGS_ACK)
         .read(SETTINGS_ACK)
         .build();
+    let mock = mock.compat();
 
-    let h2 = server::handshake(mock).wait().unwrap();
+    let h2 = server::handshake(mock)
+        .compat()
+        .await
+        .unwrap();
+    let mut h2 = h2.compat();
 
-    assert!(Stream::wait(h2).next().is_none());
+    assert!(h2.next().await.is_none());
 }
 
-#[test]
-fn server_builder_set_max_concurrent_streams() {
+#[runtime::test]
+async fn server_builder_set_max_concurrent_streams() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let mut settings = frame::Settings::default();
     settings.set_max_concurrent_streams(Some(1));
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_custom_settings(settings)
         .send_frame(
             frames::headers(1)
@@ -51,36 +61,41 @@ fn server_builder_set_max_concurrent_streams() {
     let mut builder = server::Builder::new();
     builder.max_concurrent_streams(1);
 
-    let h2 = builder
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|srv| {
-            srv.into_future().unwrap().and_then(|(reqstream, srv)| {
-                let (req, mut stream) = reqstream.unwrap();
+    let h2 = async {
+        let mut srv = builder
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut srv = srv.compat();
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
 
-                assert_eq!(req.method(), &http::Method::GET);
+        assert_eq!(req.method(), &http::Method::GET);
 
-                let rsp =
-                    http::Response::builder()
-                        .status(200).body(())
-                        .unwrap();
-                stream.send_response(rsp, true).unwrap();
+        let rsp =
+            http::Response::builder()
+                .status(200).body(())
+                .unwrap();
+        stream.send_response(rsp, true).unwrap();
 
-                srv.into_future().unwrap().map(|_| ())
-            })
-        });
+        srv.get_mut()
+            .close()
+            .compat()
+            .await
+            .unwrap();
+    };
 
-    h2.join(client).wait().expect("wait");
+    join!(h2, client);
 }
 
-#[test]
-fn serve_request() {
+#[runtime::test]
+async fn serve_request() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(
             frames::headers(1)
@@ -90,30 +105,38 @@ fn serve_request() {
         .recv_frame(frames::headers(1).response(200).eos())
         .close();
 
-    let srv = server::handshake(io).expect("handshake").and_then(|srv| {
-        srv.into_future().unwrap().and_then(|(reqstream, srv)| {
-            let (req, mut stream) = reqstream.unwrap();
+    let srv = async {
+        let mut srv = server::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut srv = srv.compat();
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
 
-            assert_eq!(req.method(), &http::Method::GET);
+        assert_eq!(req.method(), &http::Method::GET);
 
-            let rsp = http::Response::builder().status(200).body(()).unwrap();
-            stream.send_response(rsp, true).unwrap();
+        let rsp = http::Response::builder().status(200).body(()).unwrap();
+        stream.send_response(rsp, true).unwrap();
 
-            srv.into_future().unwrap().map(|_| ())
-        })
-    });
+        srv.get_mut()
+            .close()
+            .compat()
+            .await
+            .unwrap();
+    };
 
-    srv.join(client).wait().expect("wait");
+    join!(srv, client);
 }
 
 #[test]
 #[ignore]
 fn accept_with_pending_connections_after_socket_close() {}
 
-#[test]
-fn recv_invalid_authority() {
+#[runtime::test]
+async fn recv_invalid_authority() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let bad_auth = util::byte_str("not:a/good authority");
     let mut bad_headers: frame::Headers = frames::headers(1)
@@ -124,23 +147,31 @@ fn recv_invalid_authority() {
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(bad_headers)
         .recv_frame(frames::reset(1).protocol_error())
         .close();
 
-    let srv = server::handshake(io)
-        .expect("handshake")
-        .and_then(|srv| srv.into_future().unwrap().map(|_| ()));
+    let srv = async {
+        let mut srv = server::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
 
-    srv.join(client).wait().expect("wait");
+        srv.close()
+            .compat()
+            .await
+            .unwrap();
+    };
+
+    join!(srv, client);
 }
 
-#[test]
-fn recv_connection_header() {
+#[runtime::test]
+async fn recv_connection_header() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let req = |id, name, val| {
         frames::headers(id)
@@ -151,7 +182,6 @@ fn recv_connection_header() {
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(req(1, "connection", "foo"))
         .send_frame(req(3, "keep-alive", "5"))
@@ -165,21 +195,30 @@ fn recv_connection_header() {
         .recv_frame(frames::reset(9).protocol_error())
         .close();
 
-    let srv = server::handshake(io)
-        .expect("handshake")
-        .and_then(|srv| srv.into_future().unwrap()).map(|_| ());
+    let srv = async {
+        let mut srv = server::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
 
-    srv.join(client).wait().expect("wait");
+        srv.close()
+            .compat()
+            .await
+            .unwrap();
+    };
+
+    join!(srv, client);
 }
 
-#[test]
-fn sends_reset_cancel_when_req_body_is_dropped() {
+#[runtime::test]
+// FIXME: This test name does not describe the condition it's testing
+async fn sends_reset_cancel_when_req_body_is_dropped() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(
             frames::headers(1)
@@ -189,30 +228,39 @@ fn sends_reset_cancel_when_req_body_is_dropped() {
         .recv_frame(frames::reset(1).cancel())
         .close();
 
-    let srv = server::handshake(io).expect("handshake").and_then(|srv| {
-        srv.into_future().unwrap().and_then(|(reqstream, srv)| {
-            let (req, mut stream) = reqstream.unwrap();
+    let srv = async {
+        let mut srv = server::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut srv = srv.compat();
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
 
-            assert_eq!(req.method(), &http::Method::POST);
+        assert_eq!(req.method(), &http::Method::POST);
 
-            let rsp = http::Response::builder().status(200).body(()).unwrap();
-            stream.send_response(rsp, true).unwrap();
+        let rsp = http::Response::builder().status(200).body(()).unwrap();
+        stream.send_response(rsp, true).unwrap();
 
-            srv.into_future().unwrap().map(|_| ())
-        })
-    });
+        drop((req, stream));
 
-    srv.join(client).wait().expect("wait");
+        srv.get_mut()
+            .close()
+            .compat()
+            .await
+            .unwrap()
+    };
+
+    join!(srv, client);
 }
 
-#[test]
-fn abrupt_shutdown() {
+#[runtime::test]
+async fn abrupt_shutdown() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(
             frames::headers(1)
@@ -221,44 +269,48 @@ fn abrupt_shutdown() {
         .recv_frame(frames::go_away(1).internal_error())
         .recv_eof();
 
-    let srv = server::handshake(io).expect("handshake").and_then(|srv| {
-        srv.into_future().unwrap().and_then(|(item, mut srv)| {
-            let (req, tx) = item.expect("server receives request");
+    let srv = async {
+        let mut srv = server::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut srv = srv.compat();
+        let (req, tx) = srv.next().await.expect("server receives request").unwrap();
 
-            let req_fut = req
-                .into_body()
-                .concat2()
-                .map(|_| drop(tx))
-                .expect_err("request body should error")
-                .map(|err| {
-                    assert_eq!(
-                        err.reason(),
-                        Some(Reason::INTERNAL_ERROR),
-                        "streams should be also error with user's reason",
-                    );
-                });
+        let req_fut = req
+            .into_body()
+            .compat()
+            .try_concat()
+            .inspect(|_| drop(tx))
+            .map(|res| {
+                let err = res.expect_err("request body should error");
+                assert_eq!(
+                    err.reason(),
+                    Some(Reason::INTERNAL_ERROR),
+                    "streams should be also error with user's reason",
+                );
+            });
 
-            srv.abrupt_shutdown(Reason::INTERNAL_ERROR);
+        let srv_fut = srv
+            .get_mut()
+            .abrupt_shutdown(Reason::INTERNAL_ERROR)
+            .compat()
+            .map(Result::unwrap);
 
-            let srv_fut = futures::future::poll_fn(move || {
-                srv.poll_close()
-            }).expect("server");
+        join!(req_fut, srv_fut);
+    };
 
-            req_fut.join(srv_fut)
-        })
-    });
-
-    srv.join(client).wait().expect("wait");
+    join!(srv, client);
 }
 
-#[test]
-fn graceful_shutdown() {
+#[runtime::test]
+async fn graceful_shutdown() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(
             frames::headers(1)
@@ -266,8 +318,8 @@ fn graceful_shutdown() {
                 .eos(),
         )
         // 2^31 - 1 = 2147483647
-        // Note: not using a constant in the library because library devs
-        // can be unsmart.
+        // Note: not using a constant in the library in order to test that
+        // the constant has the correct value
         .recv_frame(frames::go_away(2147483647))
         .recv_frame(frames::ping(frame::Ping::SHUTDOWN))
         .recv_frame(frames::headers(1).response(200).eos())
@@ -288,63 +340,62 @@ fn graceful_shutdown() {
         .recv_frame(frames::headers(3).response(200).eos())
         .recv_eof();
 
-    let srv = server::handshake(io)
-        .expect("handshake")
-        .and_then(|srv| {
-            srv.into_future().unwrap()
-        })
-        .and_then(|(reqstream, mut srv)| {
-            let (req, mut stream) = reqstream.unwrap();
+    let srv = async {
+        let mut srv = server::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut srv = srv.compat();
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
 
-            assert_eq!(req.method(), &http::Method::GET);
+        assert_eq!(req.method(), &http::Method::GET);
 
-            srv.graceful_shutdown();
+        let _ = srv.get_mut().graceful_shutdown();
+
+        let rsp = http::Response::builder()
+            .status(200)
+            .body(())
+            .unwrap();
+        stream.send_response(rsp, true).unwrap();
+
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
+
+        assert_eq!(req.method(), &http::Method::POST);
+        let body = req.into_parts().1;
+
+        let body = async {
+            let buf = body
+                .compat()
+                .map(Result::unwrap)
+                .concat()
+                .await;
+            assert!(buf.is_empty());
 
             let rsp = http::Response::builder()
                 .status(200)
                 .body(())
                 .unwrap();
-            stream.send_response(rsp, true).unwrap();
+            stream.send_response(rsp, true)
+        };
 
-            srv.into_future().unwrap()
-        })
-        .and_then(|(reqstream, srv)| {
-            let (req, mut stream) = reqstream.unwrap();
-            assert_eq!(req.method(), &http::Method::POST);
-            let body = req.into_parts().1;
+        let srv = srv.get_mut()
+            .close()
+            .compat();
 
-            let body = body.concat2().and_then(move |buf| {
-                assert!(buf.is_empty());
+        try_join!(srv, body).unwrap();
+    };
 
-                let rsp = http::Response::builder()
-                    .status(200)
-                    .body(())
-                    .unwrap();
-                stream.send_response(rsp, true).unwrap();
-                Ok(())
-            });
-
-            srv.into_future()
-                .map(|(req, _srv)| {
-                    assert!(req.is_none(), "unexpected request");
-                })
-                .drive(body)
-                .and_then(|(srv, ())| {
-                    srv.expect("srv")
-                })
-        });
-
-    srv.join(client).wait().expect("wait");
+    join!(srv, client);
 }
 
-#[test]
-fn sends_reset_cancel_when_res_body_is_dropped() {
+#[runtime::test]
+async fn sends_reset_cancel_when_res_body_is_dropped() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(
             frames::headers(1)
@@ -363,9 +414,15 @@ fn sends_reset_cancel_when_res_body_is_dropped() {
         .recv_frame(frames::reset(3).cancel())
         .close();
 
-    let srv = server::handshake(io).expect("handshake").and_then(|srv| {
-        srv.into_future().unwrap().and_then(|(reqstream, srv)| {
-            let (req, mut stream) = reqstream.unwrap();
+    let srv = async {
+        let mut srv = server::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut srv = srv.compat();
+
+        {
+            let (req, mut stream) = srv.next().await.unwrap().unwrap();
 
             assert_eq!(req.method(), &http::Method::GET);
 
@@ -374,11 +431,9 @@ fn sends_reset_cancel_when_res_body_is_dropped() {
                 .body(())
                 .unwrap();
             stream.send_response(rsp, false).unwrap();
-            // SendStream dropped
-
-            srv.into_future().unwrap()
-        }).and_then(|(reqstream, srv)| {
-            let (_req, mut stream) = reqstream.unwrap();
+        }
+        {
+            let (_req, mut stream) = srv.next().await.unwrap().unwrap();
 
             let rsp = http::Response::builder()
                 .status(200)
@@ -387,22 +442,26 @@ fn sends_reset_cancel_when_res_body_is_dropped() {
             let mut tx = stream.send_response(rsp, false).unwrap();
             tx.send_data(vec![0; 10].into(), false).unwrap();
             // no send_data with eos
+        }
 
-            srv.into_future().unwrap().map(|_| ())
-        })
-    });
+        srv.get_mut()
+            .close()
+            .compat()
+            .await
+            .unwrap();
+    };
 
-    srv.join(client).wait().expect("wait");
+    join!(srv, client);
 }
 
-#[test]
-fn too_big_headers_sends_431() {
+#[runtime::test]
+async fn too_big_headers_sends_431() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_custom_settings(
             frames::settings()
                 .max_header_list_size(10)
@@ -417,29 +476,30 @@ fn too_big_headers_sends_431() {
         .idle_ms(10)
         .close();
 
-    let srv = server::Builder::new()
-        .max_header_list_size(10)
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|srv| {
-            srv.into_future()
-                .expect("server")
-                .map(|(req, _)| {
-                    assert!(req.is_none(), "req is {:?}", req);
-                })
-        });
+    let srv = async {
+        let mut srv = server::Builder::new()
+            .max_header_list_size(10)
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .expect("handshake");
 
-    srv.join(client).wait().expect("wait");
+        srv.close()
+            .compat()
+            .await
+            .unwrap();
+    };
+    join!(client, srv);
 }
 
-#[test]
-fn too_big_headers_sends_reset_after_431_if_not_eos() {
+#[runtime::test]
+async fn too_big_headers_sends_reset_after_431_if_not_eos() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_custom_settings(
             frames::settings()
                 .max_header_list_size(10)
@@ -453,29 +513,30 @@ fn too_big_headers_sends_reset_after_431_if_not_eos() {
         .recv_frame(frames::reset(1).refused())
         .close();
 
-    let srv = server::Builder::new()
-        .max_header_list_size(10)
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|srv| {
-            srv.into_future()
-                .expect("server")
-                .map(|(req, _)| {
-                    assert!(req.is_none(), "req is {:?}", req);
-                })
-        });
+    let srv = async {
+        let mut srv = server::Builder::new()
+            .max_header_list_size(10)
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .expect("handshake");
 
-    srv.join(client).wait().expect("wait");
+        srv.close()
+            .compat()
+            .await
+            .unwrap();
+    };
+    join!(client, srv);
 }
 
-#[test]
-fn poll_reset() {
+#[runtime::test]
+async fn poll_reset() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(
             frames::headers(1)
@@ -486,42 +547,38 @@ fn poll_reset() {
         .send_frame(frames::reset(1).cancel())
         .close();
 
-    let srv = server::Builder::new()
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|srv| {
-            srv.into_future()
-                .expect("server")
-                .map(|(req, conn)| {
-                    (req.expect("request"), conn)
-                })
-        })
-        .and_then(|((_req, mut tx), conn)| {
-            let conn = conn.into_future()
-                .map(|(req, _)| assert!(req.is_none(), "no second request"))
-                .expect("conn");
-            conn.join(
-                futures::future::poll_fn(move || {
-                    tx.poll_reset()
-                })
-                .map(|reason| {
-                    assert_eq!(reason, Reason::CANCEL);
-                })
-                .expect("poll_reset")
-            )
-        });
+    let srv = async {
+        let mut srv = server::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .unwrap();
+        let mut srv = srv.compat();
 
-    srv.join(client).wait().expect("wait");
+        let (_req, mut tx) = srv.next().await.unwrap().unwrap();
+
+        let conn_closed = srv.get_mut()
+            .close()
+            .compat()
+            .map(Result::unwrap);
+        let stream_reset = tx.client_reset()
+            .compat()
+            .map_ok(|reason| assert_eq!(reason, Reason::CANCEL))
+            .map(Result::unwrap);
+        join!(conn_closed, stream_reset);
+    };
+
+    join!(srv, client);
 }
 
-#[test]
-fn poll_reset_io_error() {
+#[runtime::test]
+async fn poll_reset_io_error() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(
             frames::headers(1)
@@ -531,39 +588,39 @@ fn poll_reset_io_error() {
         .idle_ms(10)
         .close();
 
-    let srv = server::Builder::new()
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|srv| {
-            srv.into_future()
-                .expect("server")
-                .map(|(req, conn)| {
-                    (req.expect("request"), conn)
-                })
-        })
-        .and_then(|((_req, mut tx), conn)| {
-            let conn = conn.into_future()
-                .map(|(req, _)| assert!(req.is_none(), "no second request"))
-                .expect("conn");
-            conn.join(
-                futures::future::poll_fn(move || {
-                    tx.poll_reset()
-                })
-                .expect_err("poll_reset should error")
-            )
-        });
+    let srv = async {
+        let mut srv = server::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut srv = srv.compat();
 
-    srv.join(client).wait().expect("wait");
+        let (_req, mut tx) = srv.next().await.unwrap().unwrap();
+
+        let conn_closed = srv.get_mut()
+            .close()
+            .compat()
+            .map(Result::unwrap);
+
+        let stream_reset = tx.client_reset();
+        let stream_reset = stream_reset.compat();
+
+        let (_, reset) = join!(conn_closed, stream_reset);
+        reset.expect_err("poll_reset should error");
+    };
+
+    join!(srv, client);
 }
 
-#[test]
-fn poll_reset_after_send_response_is_user_error() {
+#[runtime::test]
+async fn poll_reset_after_send_response_is_user_error() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(
             frames::headers(1)
@@ -582,56 +639,60 @@ fn poll_reset_after_send_response_is_user_error() {
         .idle_ms(10)
         .close();
 
-    let srv = server::Builder::new()
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|srv| {
-            srv.into_future()
-                .expect("server")
-                .map(|(req, conn)| {
-                    (req.expect("request"), conn)
-                })
-        })
-        .and_then(|((_req, mut tx), conn)| {
-            let conn = conn.into_future()
-                .map(|(req, _)| assert!(req.is_none(), "no second request"))
-                .expect("conn");
-            tx.send_response(Response::new(()), false).expect("response");
-            conn.join(
-                futures::future::poll_fn(move || {
-                    tx.poll_reset()
-                })
-                .expect_err("poll_reset should error")
-            )
-        });
+    let srv = async {
+        let mut srv = server::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut srv = srv.compat();
 
-    srv.join(client).wait().expect("wait");
+        {
+            let (_req, mut tx) = srv.next().await.unwrap().unwrap();
+
+            tx.send_response(Response::new(()), false).expect("response");
+            tx.client_reset()
+                .compat()
+                .await
+                .expect_err("poll_reset should error");
+        }
+
+        srv.get_mut()
+            .close()
+            .compat()
+            .await
+            .unwrap();
+    };
+
+    join!(srv, client);
 }
 
-#[test]
-fn server_error_on_unclean_shutdown() {
-    use std::io::Write;
-
+#[runtime::test]
+async fn server_error_on_unclean_shutdown() {
     let _ = env_logger::try_init();
     let (io, mut client) = mock::new();
+    let io = io.compat();
 
     let srv = server::Builder::new()
         .handshake::<_, Bytes>(io);
+    let srv = srv.compat();
 
-    client.write_all(b"PRI *").expect("write");
+    client.write_all(b"PRI *")
+        .await
+        .expect("write");
     drop(client);
 
-    srv.wait().expect_err("should error");
+    srv.await.expect_err("should error");
 }
 
-#[test]
-fn request_without_authority() {
+#[runtime::test]
+async fn request_without_authority() {
     let _ = env_logger::try_init();
     let (io, client) = mock::new();
+    let io = io.compat();
 
     let client = client
         .assert_server_handshake()
-        .unwrap()
         .recv_settings()
         .send_frame(
             frames::headers(1)
@@ -642,18 +703,26 @@ fn request_without_authority() {
         .recv_frame(frames::headers(1).response(200).eos())
         .close();
 
-    let srv = server::handshake(io).expect("handshake").and_then(|srv| {
-        srv.into_future().unwrap().and_then(|(reqstream, srv)| {
-            let (req, mut stream) = reqstream.unwrap();
+    let srv = async {
+        let mut srv = server::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut srv = srv.compat();
 
-            assert_eq!(req.uri().path(), "/just-a-path");
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
 
-            let rsp = Response::new(());
-            stream.send_response(rsp, true).unwrap();
+        assert_eq!(req.uri().path(), "/just-a-path");
 
-            srv.into_future().unwrap().map(|_| ())
-        })
-    });
+        let rsp = Response::new(());
+        stream.send_response(rsp, true).unwrap();
 
-    srv.join(client).wait().expect("wait");
+        srv.get_mut()
+            .close()
+            .compat()
+            .await
+            .unwrap();
+    };
+
+    join!(srv, client);
 }

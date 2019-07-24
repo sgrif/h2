@@ -71,3 +71,6 @@ rustls = "0.12"
 tokio-rustls = "0.5.0"
 webpki = "0.18"
 webpki-roots = "0.14"
+
+[replace]
+"futures-preview:0.3.0-alpha.17" = { git = "https://github.com/rust-lang-nursery/futures-rs.git" }
