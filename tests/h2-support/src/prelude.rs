@@ -81,6 +81,7 @@ where
     fn run<F: Future + Unpin>(&mut self, f: F) -> F::Output {
         use futures01::Future;
         use futures::executor::block_on;
+        use futures::select;
 
         let mut connection_future = future::poll_fn(|_| {
             util::poll_01_to_03(self.poll())

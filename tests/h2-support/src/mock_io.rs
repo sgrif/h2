@@ -74,6 +74,7 @@
 
 #![allow(deprecated)]
 
+use futures::ready;
 use std::{cmp, io};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};

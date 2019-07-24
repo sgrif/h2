@@ -1,10 +1,11 @@
 use h2;
 
-use futures::prelude::*;
-use super::string::{String, TryFrom};
 use bytes::Bytes;
-use std::task::*;
+use futures::prelude::*;
+use futures::ready;
 use std::pin::Pin;
+use std::task::*;
+use string::{String, TryFrom};
 
 pub fn byte_str(s: &str) -> String<Bytes> {
     String::try_from(Bytes::from(s)).unwrap()

@@ -3,11 +3,12 @@ use crate::{frames, SendFrame};
 use h2::{self, RecvError, SendError};
 use h2::frame::{self, Frame};
 
-use futures::prelude::*;
 use futures::channel::oneshot;
-use futures::task::*;
 use futures::compat::*;
 use futures::executor::block_on;
+use futures::prelude::*;
+use futures::ready;
+use futures::task::*;
 
 use pin_utils::*;
 
