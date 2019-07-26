@@ -3,7 +3,7 @@ use crate::frame::Reason;
 use crate::proto::{self, WindowSize};
 
 use bytes::{Bytes, IntoBuf};
-use futures::{self, Poll, Async, try_ready};
+use futures::{self, Future, Poll, Async, try_ready};
 use http::{HeaderMap};
 
 use std::fmt;
@@ -214,6 +214,11 @@ pub struct Pong {
     _p: (),
 }
 
+/// Future for [`SendStream::reset`]
+pub struct Reset<'a, B: IntoBuf> {
+    send_stream: &'a mut SendStream<B>,
+}
+
 // ===== impl SendStream =====
 
 impl<B: IntoBuf> SendStream<B> {
@@ -368,6 +373,15 @@ impl<B: IntoBuf> SendStream<B> {
     /// `Reason`.
     pub fn poll_reset(&mut self) -> Poll<Reason, crate::Error> {
         self.inner.poll_reset(proto::PollReset::Streaming)
+    }
+
+    /// A future which resolves when the client resets this stream.
+    ///
+    /// See [`SendStream::poll_reset`] for details
+    pub fn reset(&mut self) -> Reset<'_, B> {
+        Reset {
+            send_stream: self,
+        }
     }
 
     /// Returns the stream ID of this `SendStream`.
@@ -614,5 +628,28 @@ impl fmt::Debug for Pong {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("Pong")
             .finish()
+    }
+}
+
+// ===== impl Reset =====
+
+impl<'a, B> fmt::Debug for Reset<'a, B>
+where
+    B: IntoBuf,
+    SendStream<B>: fmt::Debug,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("Reset")
+            .field("send_stream", &self.send_stream)
+            .finish()
+    }
+}
+
+impl<'a, B: IntoBuf> Future for Reset<'a, B> {
+    type Item = Reason;
+    type Error = crate::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.send_stream.poll_reset()
     }
 }

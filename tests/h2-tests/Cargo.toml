@@ -12,4 +12,5 @@ h2-support = { path = "../h2-support" }
 log = "0.4.1"
 tokio = "0.1.8"
 futures-preview = { version = "0.3.0-alpha.17" }
+futures01 = { version = "0.1", package = "futures" }
 runtime = "0.3.0-alpha.6"

@@ -1,29 +1,40 @@
-use h2_support::prelude::*;
+#![deny(warnings)]
+#![allow(unused_mut)] // FIXME: Remove once std::future port is finished
+#![feature(async_await)]
 
-#[test]
-fn handshake() {
+use h2_support::prelude::*;
+use futures::compat::*;
+use futures::{join, pending, poll, try_join};
+
+#[runtime::test]
+async fn handshake() {
     let _ = env_logger::try_init();
 
     let mock = mock_io::Builder::new()
         .handshake()
         .write(SETTINGS_ACK)
         .build();
+    let mock = mock.compat();
 
-    let (_client, h2) = client::handshake(mock).wait().unwrap();
+    let (_client, h2) = client::handshake(mock)
+        .compat()
+        .await
+        .unwrap();
+    let h2 = h2.compat();
 
     log::trace!("hands have been shook");
 
     // At this point, the connection should be closed
-    h2.wait().unwrap();
+    h2.await.unwrap();
 }
 
-#[test]
-fn client_other_thread() {
+#[runtime::test]
+async fn client_other_thread() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(1)
@@ -33,29 +44,35 @@ fn client_other_thread() {
         .send_frame(frames::headers(1).response(200).eos())
         .close();
 
-    let h2 = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, h2)| {
-            ::std::thread::spawn(move || {
-                let request = Request::builder()
-                    .uri("https://http2.akamai.com/")
-                    .body(())
-                    .unwrap();
-                let res = client
-                    .send_request(request, true)
-                    .unwrap().0
-                    .wait()
-                    .expect("request");
-                assert_eq!(res.status(), StatusCode::OK);
-            });
-
-            h2.expect("h2")
+    let h2 = async {
+        let (mut client, h2) = client::handshake(io)
+            .compat()
+            .await
+            .unwrap();
+        let mut h2 = h2.compat();
+        let client = runtime::spawn(async move {
+            let request = Request::builder()
+                .uri("https://http2.akamai.com/")
+                .body(())
+                .unwrap();
+            let res = client
+                .send_request(request, true)
+                .unwrap().0
+                .compat()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            Ok(())
         });
-    h2.join(srv).wait().expect("wait");
+
+        try_join!(h2, client).unwrap();
+    };
+
+    join!(h2, srv);
 }
 
-#[test]
-fn recv_invalid_server_stream_id() {
+#[runtime::test]
+async fn recv_invalid_server_stream_id() {
     let _ = env_logger::try_init();
 
     let mock = mock_io::Builder::new()
@@ -71,8 +88,12 @@ fn recv_invalid_server_stream_id() {
         // Write GO_AWAY
         .write(&[0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
         .build();
+    let mock = mock.compat();
 
-    let (mut client, h2) = client::handshake(mock).wait().unwrap();
+    let (mut client, h2) = client::handshake(mock)
+        .compat()
+        .await
+        .unwrap();
 
     // Send the request
     let request = Request::builder()
@@ -84,58 +105,59 @@ fn recv_invalid_server_stream_id() {
     let (response, _) = client.send_request(request, true).unwrap();
 
     // The connection errors
-    assert!(h2.wait().is_err());
+    let h2 = h2.compat();
+    assert!(h2.await.is_err());
 
     // The stream errors
-    assert!(response.wait().is_err());
+    let response = response.compat();
+    assert!(response.await.is_err());
 }
 
-#[test]
-fn request_stream_id_overflows() {
+#[runtime::test]
+async fn request_stream_id_overflows() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
+    let h2 = async {
+        let (mut client, mut h2) = client::Builder::new()
+            .initial_stream_id(::std::u32::MAX >> 1)
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut h2 = h2.compat().map(Result::unwrap);
 
-    let h2 = client::Builder::new()
-        .initial_stream_id(::std::u32::MAX >> 1)
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|(mut client, h2)| {
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-            // first request is allowed
-            let (response, _) = client.send_request(request, true).unwrap();
+        // first request is allowed
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.compat();
+        h2.drive(response).await.unwrap();
 
-            h2.drive(response).and_then(move |(h2, _)| {
-                let request = Request::builder()
-                    .method(Method::GET)
-                    .uri("https://example.com/")
-                    .body(())
-                    .unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-                // second cannot use the next stream id, it's over
+        // second cannot use the next stream id, it's over
+        let poll_err = client.poll_ready().unwrap_err();
+        assert_eq!(poll_err.to_string(), "user error: stream ID overflowed");
 
-                let poll_err = client.poll_ready().unwrap_err();
-                assert_eq!(poll_err.to_string(), "user error: stream ID overflowed");
+        let err = client.send_request(request, true).unwrap_err();
+        assert_eq!(err.to_string(), "user error: stream ID overflowed");
 
-                let err = client.send_request(request, true).unwrap_err();
-                assert_eq!(err.to_string(), "user error: stream ID overflowed");
-
-                h2.expect("h2").map(|ret| {
-                    // Hold on to the `client` handle to avoid sending a GO_AWAY
-                    // frame.
-                    drop(client);
-                    ret
-                })
-            })
-        });
+        // Hold on to the `client` handle to avoid sending a GO_AWAY
+        // frame.
+        h2.await;
+    };
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(::std::u32::MAX >> 1)
@@ -150,20 +172,20 @@ fn request_stream_id_overflows() {
         .idle_ms(10)
         .close();
 
-    h2.join(srv).wait().expect("wait");
+    join!(h2, srv);
 }
 
-#[test]
-fn client_builder_max_concurrent_streams() {
+#[runtime::test]
+async fn client_builder_max_concurrent_streams() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let mut settings = frame::Settings::default();
     settings.set_max_concurrent_streams(Some(1));
 
     let srv = srv
         .assert_client_handshake()
-        .unwrap()
         .recv_custom_settings(settings)
         .recv_frame(
             frames::headers(1)
@@ -176,194 +198,182 @@ fn client_builder_max_concurrent_streams() {
     let mut builder = client::Builder::new();
     builder.max_concurrent_streams(1);
 
-    let h2 = builder
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|(mut client, h2)| {
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+    let h2 = async {
+        let (mut client, mut h2) = builder
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut h2 = h2.compat().map(Result::unwrap);
 
-            let (response, _) = client.send_request(request, true).unwrap();
-            h2.drive(response).map(move |(h2, _)| (client, h2))
-        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-    h2.join(srv).wait().expect("wait");
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.compat().map(Result::unwrap);
+        join!(h2, response);
+    };
+
+    join!(h2, srv);
 }
 
-#[test]
-fn request_over_max_concurrent_streams_errors() {
+#[runtime::test]
+async fn request_over_max_concurrent_streams_errors() {
+    use futures01::future::Future as _;
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
-
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake_with_settings(frames::settings()
                 // super tiny server
                 .max_concurrent_streams(1))
-        .unwrap()
         .recv_settings()
-        .recv_frame(
-            frames::headers(1)
-                .request("POST", "https://example.com/")
-                .eos(),
-        )
-        .send_frame(frames::headers(1).response(200).eos())
+        .recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+        .send_frame(frames::headers(1).response(200))
+        .recv_frame(frames::data(1, "hello").eos())
+        .send_frame(frames::data(1, "").eos())
         .recv_frame(frames::headers(3).request("POST", "https://example.com/"))
         .send_frame(frames::headers(3).response(200))
         .recv_frame(frames::data(3, "hello").eos())
         .send_frame(frames::data(3, "").eos())
-        .recv_frame(frames::headers(5).request("POST", "https://example.com/"))
-        .send_frame(frames::headers(5).response(200))
-        .recv_frame(frames::data(5, "hello").eos())
-        .send_frame(frames::data(5, "").eos())
         .close();
 
-    let h2 = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, h2)| {
-            // we send a simple req here just to drive the connection so we can
-            // receive the server settings.
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+    let h2 = async {
+        let (mut client, h2) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let h2 = h2.compat().map(Result::unwrap);
+        let mut h2 = h2.boxed();
 
-            // first request is allowed
-            let (response, _) = client.send_request(request, true).unwrap();
-            h2.drive(response).map(move |(h2, _)| (client, h2))
-        })
-        .and_then(|(mut client, h2)| {
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+        // Ensure we receive the server's settings
+        // FIXME: Remove the .boxed here after std::future port is complete
+        assert!(!yield_and_poll_once(h2.as_mut()).boxed().await.is_ready());
 
-            // first request is allowed
-            let (resp1, mut stream1) = client.send_request(request, false).unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+        // first request is allowed
+        let (resp1, mut stream1) = client.send_request(request, false).unwrap();
 
-            // second request is put into pending_open
-            let (resp2, mut stream2) = client.send_request(request, false).unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+        // second request is put into pending_open
+        let (resp2, mut stream2) = client.send_request(request, false).unwrap();
 
-            // third stream is over max concurrent
-            assert!(client.poll_ready().expect("poll_ready").is_not_ready());
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-            let err = client.send_request(request, true).unwrap_err();
-            assert_eq!(err.to_string(), "user error: rejected");
+        // third stream is over max concurrent
+        assert!(client.poll_ready().expect("poll_ready").is_not_ready());
 
-            stream1.send_data("hello".into(), true).expect("req send_data");
+        let err = client.send_request(request, true).unwrap_err();
+        assert_eq!(err.to_string(), "user error: rejected");
 
-            h2.drive(resp1.expect("req")).and_then(move |(h2, _)| {
-                stream2.send_data("hello".into(), true)
-                    .expect("req2 send_data");
-                h2.expect("h2").join(resp2.expect("req2"))
-            })
-        });
+        stream1.send_data("hello".into(), true).expect("req send_data");
 
-    h2.join(srv).wait().expect("wait");
+        let resp1 = resp1.compat();
+        h2.drive(resp1).await.unwrap();
+        stream2.send_data("hello".into(), true).unwrap();
+        let resp2 = resp2.compat().map(Result::unwrap);
+        join!(h2, resp2);
+    };
+
+    // FIXME: Remove this compat nonsense once std::future port is complete
+    // This test ends up calling `task::current` deep in h2, which requires
+    // a futures 0.1 executor to work.
+    async {
+        join!(h2, srv);
+    }.map(Ok::<(), ()>).boxed().compat().wait().unwrap();
 }
 
-#[test]
-fn send_request_poll_ready_when_connection_error() {
+#[runtime::test]
+async fn send_request_poll_ready_when_connection_error() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
-
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake_with_settings(frames::settings()
                 // super tiny server
                 .max_concurrent_streams(1))
-        .unwrap()
         .recv_settings()
-        .recv_frame(
-            frames::headers(1)
-                .request("POST", "https://example.com/")
-                .eos(),
-        )
-        .send_frame(frames::headers(1).response(200).eos())
-        .recv_frame(frames::headers(3).request("POST", "https://example.com/").eos())
+        .recv_frame(frames::headers(1).request("POST", "https://example.com/").eos())
         .send_frame(frames::headers(8).response(200).eos())
         //.recv_frame(frames::headers(5).request("POST", "https://example.com/").eos())
         .close();
 
-    let h2 = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, h2)| {
-            // we send a simple req here just to drive the connection so we can
-            // receive the server settings.
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+    let h2 = async {
+        let (mut client, mut h2) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut h2 = h2.compat().boxed();
 
-            // first request is allowed
-            let (response, _) = client.send_request(request, true).unwrap();
-            h2.drive(response).map(move |(h2, _)| (client, h2))
-        })
-        .and_then(|(mut client, h2)| {
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+        // Ensure we receive the server's settings
+        // FIXME: Remove the .boxed here after std::future port is complete
+        assert!(!yield_and_poll_once(h2.as_mut()).boxed().await.is_ready());
 
-            // first request is allowed
-            let (resp1, _) = client.send_request(request, true).unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+        // first request is allowed
+        let (resp1, _) = client.send_request(request, true).unwrap();
+        let resp1 = resp1.compat();
 
-            // second request is put into pending_open
-            let (resp2, _) = client.send_request(request, true).unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-            // third stream is over max concurrent
-            let until_ready = futures::future::poll_fn(move || {
-                client.poll_ready()
-            }).expect_err("client poll_ready").then(|_| Ok(()));
+        // second request is put into pending_open
+        let (resp2, _) = client.send_request(request, true).unwrap();
+        let resp2 = resp2.compat();
 
-            // a FuturesUnordered is used on purpose!
-            //
-            // We don't want a join, since any of the other futures notifying
-            // will make the until_ready future polled again, but we are
-            // specifically testing that until_ready gets notified on its own.
-            let mut unordered = futures::stream::FuturesUnordered::<Box<Future<Item=(), Error=()>>>::new();
-            unordered.push(Box::new(until_ready));
-            unordered.push(Box::new(h2.expect_err("client conn").then(|_| Ok(()))));
-            unordered.push(Box::new(resp1.expect_err("req1").then(|_| Ok(()))));
-            unordered.push(Box::new(resp2.expect_err("req2").then(|_| Ok(()))));
+        // third stream is over max concurrent
+        let until_ready = client.ready();
+        let until_ready = until_ready.compat();
 
-            unordered.for_each(|_| Ok(()))
-        });
+        // a FuturesUnordered is used on purpose!
+        //
+        // We don't want a join, since any of the other futures notifying
+        // will make the until_ready future polled again, but we are
+        // specifically testing that until_ready gets notified on its own.
+        let mut unordered = futures::stream::FuturesUnordered::new();
+        unordered.push(until_ready.map(Result::unwrap_err).boxed());
+        unordered.push(h2.map(Result::unwrap_err).boxed());
+        unordered.push(resp1.map(Result::unwrap_err).boxed());
+        unordered.push(resp2.map(Result::unwrap_err).boxed());
 
-    h2.join(srv).wait().expect("wait");
+        unordered.collect::<Vec<_>>().await;
+    };
+
+    join!(h2, srv);
 }
 
-#[test]
-fn send_reset_notifies_recv_stream() {
+#[runtime::test]
+async fn send_reset_notifies_recv_stream() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
-
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(1)
@@ -374,59 +384,51 @@ fn send_reset_notifies_recv_stream() {
         .recv_frame(frames::go_away(0))
         .recv_eof();
 
-    let client = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, conn)| {
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+    let client = async {
+        let (mut client, mut conn) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut conn = conn.compat();
 
-            // first request is allowed
-            let (resp1, tx) = client.send_request(request, false).unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-            conn.drive(resp1)
-                .map(move |(conn, res)| (client, conn, tx, res))
-        })
-        .and_then(|(client, conn, mut tx, res)| {
-            let tx = futures::future::poll_fn(move || {
-                tx.send_reset(h2::Reason::REFUSED_STREAM);
-                Ok(().into())
-            });
+        let (resp1, mut tx) = client.send_request(request, false).unwrap();
+        let resp1 = resp1.compat();
+        let res = conn.drive(resp1).await.unwrap();
 
+        let rx = res.into_body()
+            .compat()
+            .try_collect::<Vec<_>>()
+            .map(Result::unwrap_err);
+        let mut rx = conn.drive(rx).boxed();
 
-            let rx = res
-                .into_body()
-                .for_each(|_| -> Result<(), _> {
-                    unreachable!("no response body expected")
-                });
-            // a FuturesUnordered is used on purpose!
-            //
-            // We don't want a join, since any of the other futures notifying
-            // will make the rx future polled again, but we are
-            // specifically testing that rx gets notified on its own.
-            let mut unordered = futures::stream::FuturesUnordered::<Box<Future<Item=(), Error=()>>>::new();
-            unordered.push(Box::new(rx.expect_err("RecvBody").then(|_| Ok(()))));
-            unordered.push(Box::new(tx));
+        // Poll `rx` and yield back after calling `send_reset` to test
+        // that `send_reset` is waking `rx` or `conn`.
+        assert!(!poll!(rx.as_mut()).is_ready());
+        tx.send_reset(h2::Reason::REFUSED_STREAM);
+        pending!();
 
-            conn.drive(unordered.for_each(|_| Ok(())))
-                .and_then(move |(conn, _)| {
-                    drop(client); // now let client gracefully goaway
-                    conn.expect("client")
-                })
-        });
+        rx.await;
 
-    client.join(srv).wait().expect("wait");
+        drop((client, tx)); // now let client gracefully goaway
+        conn.await.unwrap();
+    };
+
+    join!(client, srv);
 }
 
-#[test]
-fn http_11_request_without_scheme_or_authority() {
+#[runtime::test]
+async fn http_11_request_without_scheme_or_authority() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(1)
@@ -437,73 +439,77 @@ fn http_11_request_without_scheme_or_authority() {
         .send_frame(frames::headers(1).response(200).eos())
         .close();
 
-    let h2 = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, h2)| {
-            // HTTP_11 request with just :path is allowed
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("/")
-                .body(())
-                .unwrap();
+    let h2 = async {
+        let (mut client, h2) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let h2 = h2.compat();
 
-            let (response, _) = client.send_request(request, true).unwrap();
-            h2.drive(response)
-                .map(move |(h2, _)| (client, h2))
-        });
+        // HTTP_11 request with just :path is allowed
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(())
+            .unwrap();
 
-    h2.join(srv).wait().expect("wait");
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.compat();
+        try_join!(h2, response).unwrap();
+    };
+
+    join!(h2, srv);
 }
 
-#[test]
-fn http_2_request_without_scheme_or_authority() {
+#[runtime::test]
+async fn http_2_request_without_scheme_or_authority() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .close();
 
-    let h2 = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, h2)| {
-            // HTTP_2 with only a :path is illegal, so this request should
-            // be rejected as a user error.
-            let request = Request::builder()
-                .version(Version::HTTP_2)
-                .method(Method::GET)
-                .uri("/")
-                .body(())
-                .unwrap();
+    let h2 = async {
+        let (mut client, h2) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let h2 = h2.compat();
 
-            client
-                .send_request(request, true)
-                .expect_err("should be UserError");
+        // HTTP_2 with only a :path is illegal, so this request should
+        // be rejected as a user error.
+        let request = Request::builder()
+            .version(Version::HTTP_2)
+            .method(Method::GET)
+            .uri("/")
+            .body(())
+            .unwrap();
 
-            h2.expect("h2").map(|ret| {
-                // Hold on to the `client` handle to avoid sending a GO_AWAY frame.
-                drop(client);
-                ret
-            })
-        });
+        client
+            .send_request(request, true)
+            .expect_err("should be UserError");
 
-    h2.join(srv).wait().expect("wait");
+        h2.await.unwrap();
+    };
+
+    join!(h2, srv);
 }
 
 #[test]
 #[ignore]
 fn request_with_h1_version() {}
 
-#[test]
-fn request_with_connection_headers() {
+#[runtime::test]
+async fn request_with_connection_headers() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     // can't assert full handshake, since client never sends a request, and
     // thus never bothers to ack the settings...
     let srv = srv.read_preface()
-        .unwrap()
         .recv_frame(frames::settings())
         // goaway is required to make sure the connection closes because
         // of no active streams
@@ -519,32 +525,38 @@ fn request_with_connection_headers() {
         ("te", "boom"),
     ];
 
-    let client = client::handshake(io)
-        .expect("handshake")
-        .and_then(move |(mut client, conn)| {
-            for (name, val) in headers {
-                let req = Request::builder()
-                    .uri("https://http2.akamai.com/")
-                    .header(name, val)
-                    .body(())
-                    .unwrap();
-                let err = client.send_request(req, true).expect_err(name);
+    let client = async {
+        let (mut client, conn) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let conn = conn.compat();
 
-                assert_eq!(err.to_string(), "user error: malformed headers");
-            }
-            conn.unwrap()
-        });
+        for (name, val) in headers {
+            let req = Request::builder()
+                .uri("https://http2.akamai.com/")
+                .header(name, val)
+                .body(())
+                .unwrap();
+            let err = client.send_request(req, true).expect_err(name);
 
-    client.join(srv).wait().expect("wait");
+            assert_eq!(err.to_string(), "user error: malformed headers");
+        }
+
+        drop(client);
+        conn.await.unwrap()
+    };
+
+    join!(client, srv);
 }
 
-#[test]
-fn connection_close_notifies_response_future() {
+#[runtime::test]
+async fn connection_close_notifies_response_future() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(1)
@@ -554,40 +566,37 @@ fn connection_close_notifies_response_future() {
         // don't send any response, just close
         .close();
 
-    let client = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, conn)| {
-            let request = Request::builder()
-                .uri("https://http2.akamai.com/")
-                .body(())
-                .unwrap();
+    let client = async {
+        let (mut client, mut conn) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut conn = conn.compat();
 
-            let req = client
-                .send_request(request, true)
-                .expect("send_request1")
-                .0
-                .then(|res| {
-                    let err = res.expect_err("response");
-                    assert_eq!(
-                        err.to_string(),
-                        "broken pipe"
-                    );
-                    Ok(())
-                });
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
 
-            conn.expect("conn").join(req)
-        });
+        let (response, _) = client
+            .send_request(request, true)
+            .unwrap();
+        let response = response.compat();
+        let response = conn.drive(response).await;
+        assert_eq!(response.unwrap_err().to_string(), "broken pipe");
+        conn.await.unwrap();
+    };
 
-    client.join(srv).wait().expect("wait");
+    join!(client, srv);
 }
 
-#[test]
-fn connection_close_notifies_client_poll_ready() {
+#[runtime::test]
+async fn connection_close_notifies_client_poll_ready() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(1)
@@ -596,48 +605,42 @@ fn connection_close_notifies_client_poll_ready() {
         )
         .close();
 
-    let client = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, conn)| {
-            let request = Request::builder()
-                .uri("https://http2.akamai.com/")
-                .body(())
-                .unwrap();
+    let client = async {
+        let (mut client, mut conn) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut conn = conn.compat();
 
-            let req = client
-                .send_request(request, true)
-                .expect("send_request1")
-                .0
-                .then(|res| {
-                    let err = res.expect_err("response");
-                    assert_eq!(
-                        err.to_string(),
-                        "broken pipe"
-                    );
-                    Ok::<_, ()>(())
-                });
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
 
-            conn.drive(req)
-                .and_then(move |(_conn, _)| {
-                    let err = client.poll_ready().expect_err("poll_ready");
-                    assert_eq!(
-                        err.to_string(),
-                        "broken pipe"
-                    );
-                    Ok(())
-                })
-        });
+        let (req, _) = client
+            .send_request(request, true)
+            .unwrap();
+        let req = req.compat();
+        let res = conn.drive(req).await;
 
-    client.join(srv).wait().expect("wait");
+        assert_eq!(res.unwrap_err().to_string(), "broken pipe");
+        assert_eq!(
+            client.poll_ready().unwrap_err().to_string(),
+            "broken pipe",
+        );
+        conn.await.unwrap();
+    };
+
+    join!(client, srv);
 }
 
-#[test]
-fn sending_request_on_closed_connection() {
+#[runtime::test]
+async fn sending_request_on_closed_connection() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(1)
@@ -649,60 +652,49 @@ fn sending_request_on_closed_connection() {
         .send_frame(frames::headers(0).response(200).eos())
         .close();
 
-    let h2 = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, h2)| {
-            let request = Request::builder()
-                .uri("https://http2.akamai.com/")
-                .body(())
-                .unwrap();
+    let h2 = async {
+        let (mut client, mut h2) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut h2 = h2.compat();
 
-            // first request works
-            let req = client
-                .send_request(request, true)
-                .expect("send_request1")
-                .0
-                .expect("response1")
-                .map(|_| ());
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
 
-            // after finish request1, there should be a conn error
-            let h2 = h2.then(|res| {
-                res.expect_err("h2 error");
-                Ok::<(), ()>(())
-            });
+        // first request works
+        let (response, _) = client
+            .send_request(request, true)
+            .unwrap();
+        let response = response.compat();
+        h2.drive(response).await.unwrap();
+        // after finish request1, there should be a conn error
+        h2.await.unwrap_err();
 
-            h2.select(req)
-                .then(|res| match res {
-                    Ok((_, next)) => next,
-                    Err(_) => unreachable!("both selected futures cannot error"),
-                })
-                .map(move |_| client)
-        })
-        .and_then(|mut client| {
-            let poll_err = client.poll_ready().unwrap_err();
-            let msg = "protocol error: unspecific protocol error detected";
-            assert_eq!(poll_err.to_string(), msg);
+        let poll_err = client.poll_ready().unwrap_err();
+        let msg = "protocol error: unspecific protocol error detected";
+        assert_eq!(poll_err.to_string(), msg);
 
-            let request = Request::builder()
-                .uri("https://http2.akamai.com/")
-                .body(())
-                .unwrap();
-            let send_err = client.send_request(request, true).unwrap_err();
-            assert_eq!(send_err.to_string(), msg);
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+        let send_err = client.send_request(request, true).unwrap_err();
+        assert_eq!(send_err.to_string(), msg);
+    };
 
-            Ok(())
-        });
-
-    h2.join(srv).wait().expect("wait");
+    join!(h2, srv);
 }
 
-#[test]
-fn recv_too_big_headers() {
+#[runtime::test]
+async fn recv_too_big_headers() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_custom_settings(
             frames::settings()
                 .max_header_list_size(10)
@@ -725,64 +717,66 @@ fn recv_too_big_headers() {
         .idle_ms(10)
         .close();
 
-    let client = client::Builder::new()
-        .max_header_list_size(10)
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|(mut client, conn)| {
-            let request = Request::builder()
-                .uri("https://http2.akamai.com/")
-                .body(())
-                .unwrap();
+    let client = async {
+        let (mut client, conn) = client::Builder::new()
+            .max_header_list_size(10)
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let conn = conn.compat();
+        let conn = conn.map(Result::unwrap);
 
-            let req1 = client
-                .send_request(request, true)
-                .expect("send_request")
-                .0
-                .expect_err("response1")
-                .map(|err| {
-                    assert_eq!(
-                        err.reason(),
-                        Some(Reason::REFUSED_STREAM)
-                    );
-                });
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
 
-            let request = Request::builder()
-                .uri("https://http2.akamai.com/")
-                .body(())
-                .unwrap();
+        let req1 = client
+            .send_request(request, true)
+            .unwrap()
+            .0
+            .compat()
+            .map(|res| {
+                assert_eq!(
+                    res.unwrap_err().reason(),
+                    Some(Reason::REFUSED_STREAM)
+                );
+            });
 
-            let req2 = client
-                .send_request(request, true)
-                .expect("send_request")
-                .0
-                .expect_err("response2")
-                .map(|err| {
-                    assert_eq!(
-                        err.reason(),
-                        Some(Reason::REFUSED_STREAM)
-                    );
-                });
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
 
-            conn.drive(req1.join(req2))
-                .and_then(|(conn, _)| conn.expect("client"))
-                .map(|c| (c, client))
-        });
+        let req2 = client
+            .send_request(request, true)
+            .unwrap()
+            .0
+            .compat()
+            .map(|err| {
+                assert_eq!(
+                    err.unwrap_err().reason(),
+                    Some(Reason::REFUSED_STREAM)
+                );
+            });
 
-    client.join(srv).wait().expect("wait");
+        join!(conn, req1, req2);
+    };
 
+    join!(client, srv);
 }
 
-#[test]
-fn pending_send_request_gets_reset_by_peer_properly() {
+#[runtime::test]
+async fn pending_send_request_gets_reset_by_peer_properly() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let payload = [0; (frame::DEFAULT_INITIAL_WINDOW_SIZE * 2) as usize];
     let max_frame_size = frame::DEFAULT_MAX_FRAME_SIZE as usize;
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(1)
@@ -805,69 +799,79 @@ fn pending_send_request_gets_reset_by_peer_properly() {
 
         .close();
 
-    let client = client::Builder::new()
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|(mut client, conn)| {
-            let request = Request::builder()
-                .uri("https://http2.akamai.com/")
-                .body(())
-                .unwrap();
+    let client = async {
+        let (mut client, mut conn) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let mut conn = conn.compat();
 
-            let (response, mut stream) = client
-                .send_request(request, false)
-                .expect("send_request");
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
 
-            let response = response.expect_err("response")
-                .map(|err| {
-                    assert_eq!(
-                        err.reason(),
-                        Some(Reason::REFUSED_STREAM)
-                    );
-                });
+        let (response, mut stream) = client
+            .send_request(request, false)
+            .unwrap();
+        let response = response.compat();
 
-            // Send the data
-            stream.send_data(payload[..].into(), true).unwrap();
+        // Send the data
+        stream.send_data(payload[..].into(), true).unwrap();
 
-            conn.drive(response)
-                .and_then(|(conn, _)| conn.expect("client"))
-        });
+        let err = conn.drive(response)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.reason(),
+            Some(Reason::REFUSED_STREAM)
+        );
 
-    client.join(srv).wait().expect("wait");
+        drop((stream, client));
+        conn.await.unwrap();
+    };
+
+    join!(client, srv);
 }
 
-#[test]
-fn request_without_path() {
+#[runtime::test]
+async fn request_without_path() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(frames::headers(1).request("GET", "http://example.com/").eos())
         .send_frame(frames::headers(1).response(200).eos())
         .close();
 
-    let client = client::handshake(io)
-        .expect("handshake")
-        .and_then(move |(mut client, conn)| {
-            // Note the lack of trailing slash.
-            let request = Request::get("http://example.com")
-                .body(())
-                .unwrap();
+    let client = async {
+        let (mut client, conn) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let conn = conn.compat();
 
-            let (response, _) = client.send_request(request, true).unwrap();
+        // Note the lack of trailing slash.
+        let request = Request::get("http://example.com")
+            .body(())
+            .unwrap();
 
-            conn.drive(response)
-        });
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.compat();
+        try_join!(conn, response).unwrap();
+    };
 
-    client.join(srv).wait().unwrap();
+    join!(client, srv);
 }
 
-#[test]
-fn request_options_with_star() {
+#[runtime::test]
+async fn request_options_with_star() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     // Note the lack of trailing slash.
     let uri = uri::Uri::from_parts({
@@ -879,128 +883,141 @@ fn request_options_with_star() {
     }).unwrap();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(frames::headers(1).request("OPTIONS", uri.clone()).eos())
         .send_frame(frames::headers(1).response(200).eos())
         .close();
 
-    let client = client::handshake(io)
-        .expect("handshake")
-        .and_then(move |(mut client, conn)| {
-            let request = Request::builder()
-                .method(Method::OPTIONS)
-                .uri(uri)
-                .body(())
-                .unwrap();
+    let client = async {
+        let (mut client, conn) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let conn = conn.compat();
 
-            let (response, _) = client.send_request(request, true).unwrap();
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri(uri)
+            .body(())
+            .unwrap();
 
-            conn.drive(response)
-        });
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.compat();
+        try_join!(conn, response).unwrap();
+    };
 
-    client.join(srv).wait().unwrap();
+    join!(client, srv);
 }
 
-#[test]
-fn notify_on_send_capacity() {
+#[runtime::test]
+async fn notify_on_send_capacity() {
     // This test ensures that the client gets notified when there is additional
     // send capacity. In other words, when the server is ready to accept a new
     // stream, the client is notified.
-    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
 
     let _ = env_logger::try_init();
 
     let (io, srv) = mock::new();
-    let (done_tx, done_rx) = futures::sync::oneshot::channel();
-    let (tx, rx) = mpsc::channel();
+    let io = io.compat();
+    let (done_tx, done_rx) = futures::channel::oneshot::channel();
+    let barrier = Arc::new(Barrier::new(2));
+    let srv_barrier = barrier.clone();
 
     let mut settings = frame::Settings::default();
     settings.set_max_concurrent_streams(Some(1));
 
-    let srv = srv
-        .assert_client_handshake_with_settings(settings)
-        .unwrap()
-        // This is the ACK
-        .recv_settings()
-        .map(move |h| {
-            tx.send(()).unwrap();
-            h
-        })
-        .recv_frame(
-            frames::headers(1)
-                .request("GET", "https://www.example.com/")
-                .eos(),
-        )
-        .send_frame(frames::headers(1).response(200).eos())
-        .recv_frame(
-            frames::headers(3)
-                .request("GET", "https://www.example.com/")
-                .eos(),
-        )
-        .send_frame(frames::headers(3).response(200).eos())
-        .recv_frame(
-            frames::headers(5)
-                .request("GET", "https://www.example.com/")
-                .eos(),
-        )
-        .send_frame(frames::headers(5).response(200).eos())
+    let srv = async move {
+        let srv = srv.assert_client_handshake_with_settings(settings)
+            // This is the ACK
+            .recv_settings()
+            .inspect(move |_| { srv_barrier.wait(); })
+            .recv_frame(
+                frames::headers(1)
+                    .request("GET", "https://www.example.com/")
+                    .eos(),
+            )
+            .send_frame(frames::headers(1).response(200).eos())
+            .recv_frame(
+                frames::headers(3)
+                    .request("GET", "https://www.example.com/")
+                    .eos(),
+            )
+            .send_frame(frames::headers(3).response(200).eos())
+            .recv_frame(
+                frames::headers(5)
+                    .request("GET", "https://www.example.com/")
+                    .eos(),
+            )
+            .send_frame(frames::headers(5).response(200).eos())
+            .await;
+
         // Don't close the connection until the client is done doing its
         // checks.
-        .wait_for(done_rx)
-        .close()
-        ;
+        done_rx.await.unwrap();
+        srv.close().await;
+    };
 
-    let client = client::handshake(io)
-        .expect("handshake")
-        .and_then(move |(mut client, conn)| {
-            ::std::thread::spawn(move || {
-                rx.recv().unwrap();
+    let client = async move {
+        let (mut client, conn) = client::handshake(io)
+            .compat()
+            .await
+            .expect("handshake");
+        let conn = conn.compat();
 
-                let mut responses = vec![];
+        let client = runtime::spawn(async move {
+            barrier.wait();
 
-                for _ in 0..3 {
-                    // Wait for capacity. If the client is **not** notified,
-                    // this hangs.
-                    poll_fn(|| client.poll_ready()).wait().unwrap();
+            let mut responses = vec![];
 
-                    let request = Request::builder()
-                        .uri("https://www.example.com/")
-                        .body(())
-                        .unwrap();
+            for _ in 0i32..3 {
+                // Wait for capacity. If the client is **not** notified,
+                // this hangs.
+                client = client.ready()
+                    .compat()
+                    .await
+                    .unwrap();
 
-                    let response = client.send_request(request, true)
-                        .unwrap().0;
+                let request = Request::builder()
+                    .uri("https://www.example.com/")
+                    .body(())
+                    .unwrap();
 
-                    responses.push(response);
-                }
+                let (response, _) = client.send_request(request, true)
+                    .unwrap();
+                let response = response.compat();
 
-                for response in responses {
-                    let response = response.wait().unwrap();
-                    assert_eq!(response.status(), StatusCode::OK);
-                }
+                responses.push(response);
+            }
 
-                poll_fn(|| client.poll_ready()).wait().unwrap();
+            for response in responses {
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
 
-                done_tx.send(()).unwrap();
-            });
+            client.ready()
+                .compat()
+                .await
+                .unwrap();
 
-            conn.expect("h2")
-        })
-        .expect("client");
+            done_tx.send(()).unwrap();
+        });
 
+        let (_, conn_res) = join!(client, conn);
+        conn_res.unwrap();
+    };
 
-    client.join(srv).wait().unwrap();
+    join!(client, srv);
 }
 
-#[test]
-fn send_stream_poll_reset() {
+#[runtime::test]
+async fn send_stream_poll_reset() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let srv = srv
         .assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(1)
@@ -1009,75 +1026,73 @@ fn send_stream_poll_reset() {
         .send_frame(frames::reset(1).refused())
         .close();
 
-    let client = client::Builder::new()
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(|(mut client, conn)| {
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://example.com/")
-                .body(())
-                .unwrap();
+    let client = async {
+        let (mut client, mut conn) = client::handshake(io)
+            .compat()
+            .await
+            .unwrap();
+        let mut conn = conn.compat();
 
-            let (_response, mut tx) = client.send_request(request, false).unwrap();
-            conn.drive(futures::future::poll_fn(move || {
-                tx.poll_reset()
-            }))
-                .map(|(_, reason)| {
-                    assert_eq!(reason, Reason::REFUSED_STREAM);
-                })
-        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
 
-    client.join(srv).wait().expect("wait");
+        let (_response, mut tx) = client.send_request(request, false).unwrap();
+        let reset = tx.reset();
+        let reset = reset.compat();
+
+        let (_, reason) = try_join!(conn, reset).unwrap();
+        assert_eq!(reason, Reason::REFUSED_STREAM);
+    };
+
+    join!(client, srv);
 }
 
-#[test]
-fn drop_pending_open() {
+#[runtime::test]
+async fn drop_pending_open() {
+    use futures::channel::oneshot;
+
     // This test checks that a stream queued for pending open behaves correctly when its
     // client drops.
     let _ = env_logger::try_init();
 
     let (io, srv) = mock::new();
-    let (init_tx, init_rx) = futures::sync::oneshot::channel();
-    let (trigger_go_away_tx, trigger_go_away_rx) = futures::sync::oneshot::channel();
-    let (sent_go_away_tx, sent_go_away_rx) = futures::sync::oneshot::channel();
-    let (drop_tx, drop_rx) = futures::sync::oneshot::channel();
+    let io = io.compat();
+    let (init_tx, init_rx) = oneshot::channel();
+    let (trigger_go_away_tx, trigger_go_away_rx) = oneshot::channel();
+    let (sent_go_away_tx, sent_go_away_rx) = oneshot::channel();
+    let (drop_tx, drop_rx) = oneshot::channel();
 
     let mut settings = frame::Settings::default();
     settings.set_max_concurrent_streams(Some(2));
 
-    let srv = srv
-        .assert_client_handshake_with_settings(settings)
-        .unwrap()
-    // This is the ACK
-        .recv_settings()
-        .map(move |h| {
-            init_tx.send(()).unwrap();
-            h
-        })
-        .recv_frame(
+    let srv = async {
+        let mut srv = srv
+            .assert_client_handshake_with_settings(settings)
+            // This is the ACK
+            .recv_settings()
+            .await;
+        init_tx.send(()).unwrap();
+        srv.recv_frame(
             frames::headers(1)
                 .request("GET", "https://www.example.com/"),
-        )
-        .recv_frame(
+        ).await;
+        srv.recv_frame(
             frames::headers(3)
                 .request("GET", "https://www.example.com/")
                 .eos(),
-        )
-        .wait_for(trigger_go_away_rx)
-        .send_frame(frames::go_away(3))
-        .map(move |h| {
-            sent_go_away_tx.send(()).unwrap();
-            h
-        })
-        .wait_for(drop_rx)
-        .send_frame(frames::headers(3).response(200).eos())
-        .recv_frame(
-            frames::data(1, vec![]).eos(),
-        )
-        .send_frame(frames::headers(1).response(200).eos())
-        .close()
-        ;
+        ).await;
+        trigger_go_away_rx.await.unwrap();
+        srv.send_frame(frames::go_away(3)).await;
+        sent_go_away_tx.send(()).unwrap();
+        drop_rx.await.unwrap();
+        srv.send_frame(frames::headers(3).response(200).eos()).await;
+        srv.recv_frame(frames::data(1, vec![]).eos()).await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        srv.close().await;
+    };
 
     fn request() -> Request<()> {
         Request::builder()
@@ -1086,65 +1101,74 @@ fn drop_pending_open() {
             .unwrap()
     }
 
-    let client = client::Builder::new()
-        .max_concurrent_reset_streams(0)
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(move |(mut client, conn)| {
-            conn.expect("h2").join(init_rx.expect("init_rx").and_then(move |()| {
-                // Fill up the concurrent stream limit.
-                assert!(client.poll_ready().unwrap().is_ready());
-                let mut response1 = client.send_request(request(), false).unwrap();
-                assert!(client.poll_ready().unwrap().is_ready());
-                let response2 = client.send_request(request(), true).unwrap();
-                assert!(client.poll_ready().unwrap().is_ready());
-                let response3 = client.send_request(request(), true).unwrap();
+    let client = async {
+        let (mut client, mut conn) = client::Builder::new()
+            .max_concurrent_reset_streams(0)
+            .handshake::<_, Bytes>(io)
+            .compat()
+            .await
+            .unwrap();
+        let mut conn = conn.compat();
+        let client = async {
+            init_rx.await.unwrap();
 
-                // Trigger a GOAWAY frame to invalidate our third request.
-                trigger_go_away_tx.send(()).unwrap();
-                sent_go_away_rx.expect("sent_go_away_rx").and_then(move |_| {
-                    // Now drop all the references to that stream.
-                    drop(response3);
-                    drop(client);
-                    drop_tx.send(()).unwrap();
+            // Fill up the concurrent stream limit.
+            // FIXME: Replace `client.poll_ready` with `poll!(client.ready())`
+            assert!(client.poll_ready().unwrap().is_ready());
+            let (response1, mut stream1) = client.send_request(request(), false).unwrap();
+            assert!(client.poll_ready().unwrap().is_ready());
+            let (response2, _) = client.send_request(request(), true).unwrap();
+            assert!(client.poll_ready().unwrap().is_ready());
+            let (response3, _) = client.send_request(request(), true).unwrap();
 
-                    // Complete the second request, freeing up a stream.
-                    response2.0.expect("resp2")
-                }).and_then(move |_| {
-                    response1.1.send_data(Default::default(), true).unwrap();
-                    response1.0.expect("resp1")
-                })
-            }))
-        });
+            // Trigger a GOAWAY frame to invalidate our third request.
+            trigger_go_away_tx.send(()).unwrap();
+            sent_go_away_rx.await.unwrap();
 
+            // Now drop all the references to that stream.
+            drop(response3);
+            drop(client);
+            drop_tx.send(()).unwrap();
 
-    client.join(srv).wait().unwrap();
+            // Complete the second request, freeing up a stream.
+            let response2 = response2.compat();
+            response2.await.unwrap();
+
+            stream1.send_data(Default::default(), true).unwrap();
+            let response1 = response1.compat();
+            response1.await.unwrap();
+
+        };
+        let (conn_res, _) = join!(conn, client);
+        conn_res.unwrap();
+    };
+
+    join!(client, srv);
 }
 
-#[test]
-fn malformed_response_headers_dont_unlink_stream() {
+#[runtime::test]
+async fn malformed_response_headers_dont_unlink_stream() {
     // This test checks that receiving malformed headers frame on a stream with
     // no remaining references correctly resets the stream, without prematurely
     // unlinking it.
     let _ = env_logger::try_init();
 
     let (io, srv) = mock::new();
-    let (drop_tx, drop_rx) = futures::sync::oneshot::channel();
-    let (queued_tx, queued_rx) = futures::sync::oneshot::channel();
+    let io = io.compat();
+    let (drop_tx, drop_rx) = futures::channel::oneshot::channel();
+    let (queued_tx, queued_rx) = futures::channel::oneshot::channel();
 
-    let srv = srv
-        .assert_client_handshake()
-        .unwrap()
-        .recv_settings()
-        .recv_frame(frames::headers(1).request("GET", "http://example.com/"))
-        .recv_frame(frames::headers(3).request("GET", "http://example.com/"))
-        .recv_frame(frames::headers(5).request("GET", "http://example.com/"))
-        .map(move |h| {
-            drop_tx.send(()).unwrap();
-            h
-        })
-        .wait_for(queued_rx)
-        .send_bytes(&[
+    let srv = async {
+        let mut srv = srv
+            .assert_client_handshake()
+            .recv_settings()
+            .recv_frame(frames::headers(1).request("GET", "http://example.com/"))
+            .recv_frame(frames::headers(3).request("GET", "http://example.com/"))
+            .recv_frame(frames::headers(5).request("GET", "http://example.com/"))
+            .await;
+        drop_tx.send(()).unwrap();
+        queued_rx.await.unwrap();
+        srv.write_all(&[
             // 2 byte frame
             0, 0, 2,
             // type: HEADERS
@@ -1157,9 +1181,9 @@ fn malformed_response_headers_dont_unlink_stream() {
             144, 135
             // Per the spec, this frame should cause a stream error of type
             // PROTOCOL_ERROR.
-        ])
-        .close()
-        ;
+        ]).await.unwrap();
+        srv.close().await;
+    };
 
     fn request() -> Request<()> {
         Request::builder()
@@ -1168,45 +1192,61 @@ fn malformed_response_headers_dont_unlink_stream() {
             .unwrap()
     }
 
-    let client = client::Builder::new()
-        .handshake::<_, Bytes>(io)
-        .expect("handshake")
-        .and_then(move |(mut client, conn)| {
-            let (_req1, mut send1) = client.send_request(
+    let client = async {
+        let (mut client, mut conn) = client::handshake(io)
+            .compat()
+            .await
+            .unwrap();
+        let mut conn = conn.compat();
+
+        let client = async {
+            let (_, mut send1) = client.send_request(
                 request(), false).unwrap();
             // Use up most of the connection window.
             send1.send_data(vec![0; 65534].into(), true).unwrap();
-            let (req2, mut send2) = client.send_request(
+            let (_, mut send2) = client.send_request(
                 request(), false).unwrap();
-            let (req3, mut send3) = client.send_request(
+            let (_, mut send3) = client.send_request(
                 request(), false).unwrap();
-            conn.expect("h2").join(drop_rx.then(move |_| {
-                // Use up the remainder of the connection window.
-                send2.send_data(vec![0; 2].into(), true).unwrap();
-                // Queue up for more connection window.
-                send3.send_data(vec![0; 1].into(), true).unwrap();
-                queued_tx.send(()).unwrap();
-                Ok((req2, req3))
-            }))
-        });
 
+            drop_rx.await.unwrap();
+            drop(send1);
 
-    client.join(srv).wait().unwrap();
+            // Use up the remainder of the connection window.
+            send2.send_data(vec![0; 2].into(), true).unwrap();
+            // Queue up for more connection window.
+            send3.send_data(vec![0; 1].into(), true).unwrap();
+            queued_tx.send(()).unwrap();
+            Ok(())
+        };
+        try_join!(conn, client).unwrap();
+    };
+
+    join!(client, srv);
 }
 
-const SETTINGS: &'static [u8] = &[0, 0, 0, 4, 0, 0, 0, 0, 0];
 const SETTINGS_ACK: &'static [u8] = &[0, 0, 0, 4, 1, 0, 0, 0, 0];
 
-trait MockH2 {
-    fn handshake(&mut self) -> &mut Self;
+/// Polls a future once after yielding
+///
+/// Before yielding, `wake` will be called so this future will
+/// always be polled again
+async fn yield_and_poll_once<F: Future + Unpin>(f: F) -> Poll<F::Output> {
+    Wake.await;
+    pending!();
+    poll!(f)
 }
 
-impl MockH2 for mock_io::Builder {
-    fn handshake(&mut self) -> &mut Self {
-        self.write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-            // Settings frame
-            .write(SETTINGS)
-            .read(SETTINGS)
-            .read(SETTINGS_ACK)
+use std::future::Future;
+use std::task::*;
+use std::pin::Pin;
+struct Wake;
+
+impl Future for Wake {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        cx.waker().wake_by_ref();
+        Poll::Ready(())
     }
 }

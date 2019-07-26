@@ -58,13 +58,13 @@ pub trait FutureExt: Future {
     /// Drive `other` by polling `self`.
     ///
     /// `self` must not resolve before `other` does.
-    fn drive<T>(self, other: T) -> Drive<Self, T>
+    fn drive<'a, T>(&'a mut self, other: T) -> Drive<'a, Self, T>
     where
-        Self: Sized,
-        Drive<Self, T>: Future,
+        Self: Sized + 'a,
+        Drive<'a, Self, T>: Future,
     {
         Drive {
-            driver: Some(self),
+            driver: self,
             future: other,
         }
     }
@@ -207,40 +207,35 @@ where
 ///
 /// This is useful for H2 futures that also require the connection to be polled.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Drive<T, U> {
-    driver: Option<T>,
+pub struct Drive<'a, T, U> {
+    driver: &'a mut T,
     future: U,
 }
 
-impl<T, U> Drive<T, U> {
+impl<'a, T, U> Drive<'a, T, U> {
     // safe: There is no drop impl, and we don't move `future` from `poll`
     unsafe_pinned!(future: U);
-    // safe: We require the field be `Unpin` in `poll`
-    unsafe_unpinned!(driver: Option<T>);
+    // safe: Driver is required to be unpin
+    unsafe_unpinned!(driver: T);
 }
 
-impl<T, U> Future for Drive<T, U>
+impl<'a, T, U> Future for Drive<'a, T, U>
 where
-    T: Future<Output = ()> + Unpin,
+    T: Future + Unpin,
     U: Future,
 {
-    type Output = (T, U::Output);
+    type Output = U::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let mut looped = false;
 
         loop {
             match self.as_mut().future().poll(cx) {
-                Poll::Ready(val) => {
-                    // Get the driver
-                    let driver = self.as_mut().driver().take().unwrap();
-
-                    return (driver, val).into();
-                },
+                Poll::Ready(val) => return Poll::Ready(val),
                 Poll::Pending => {},
             }
 
-            if self.as_mut().driver().as_mut().unwrap().poll_unpin(cx).is_ready() {
+            if self.as_mut().driver().poll_unpin(cx).is_ready() {
                 if looped {
                     // Try polling the future one last time
                     panic!("driver resolved before future")
