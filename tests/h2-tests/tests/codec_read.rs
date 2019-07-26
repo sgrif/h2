@@ -1,22 +1,31 @@
+#![deny(warnings)]
+#![allow(unused_mut)] // FIXME: Remove once std::future port is finished
+#![feature(async_await)]
+
 use h2_support::prelude::*;
+use futures::compat::*;
+use futures::join;
 
 use std::error::Error;
 
-#[test]
-fn read_none() {
-    let mut codec = Codec::from(mock_io::Builder::new().build());
+#[runtime::test]
+async fn read_none() {
+    let io = mock_io::Builder::new().build();
+    let io = io.compat();
+    let mut codec = Codec::from(io);
+    let mut codec = codec.compat();
 
     assert_closed!(codec);
 }
 
-#[test]
+#[runtime::test]
 #[ignore]
-fn read_frame_too_big() {}
+async fn read_frame_too_big() {}
 
 // ===== DATA =====
 
-#[test]
-fn read_data_no_padding() {
+#[runtime::test]
+async fn read_data_no_padding() {
     let mut codec = raw_codec! {
         read => [
             0, 0, 5, 0, 0, 0, 0, 0, 1,
@@ -32,8 +41,8 @@ fn read_data_no_padding() {
     assert_closed!(codec);
 }
 
-#[test]
-fn read_data_empty_payload() {
+#[runtime::test]
+async fn read_data_empty_payload() {
     let mut codec = raw_codec! {
         read => [
             0, 0, 0, 0, 0, 0, 0, 0, 1,
@@ -48,8 +57,8 @@ fn read_data_empty_payload() {
     assert_closed!(codec);
 }
 
-#[test]
-fn read_data_end_stream() {
+#[runtime::test]
+async fn read_data_end_stream() {
     let mut codec = raw_codec! {
         read => [
             0, 0, 5, 0, 1, 0, 0, 0, 1,
@@ -65,8 +74,8 @@ fn read_data_end_stream() {
     assert_closed!(codec);
 }
 
-#[test]
-fn read_data_padding() {
+#[runtime::test]
+async fn read_data_padding() {
     let mut codec = raw_codec! {
         read => [
             0, 0, 16, 0, 0x8, 0, 0, 0, 1,
@@ -84,8 +93,8 @@ fn read_data_padding() {
     assert_closed!(codec);
 }
 
-#[test]
-fn read_push_promise() {
+#[runtime::test]
+async fn read_push_promise() {
     let mut codec = raw_codec! {
         read => [
             0, 0, 0x5,
@@ -104,8 +113,8 @@ fn read_push_promise() {
     assert_closed!(codec);
 }
 
-#[test]
-fn read_data_stream_id_zero() {
+#[runtime::test]
+async fn read_data_stream_id_zero() {
     let mut codec = raw_codec! {
         read => [
             0, 0, 5, 0, 0, 0, 0, 0, 0,
@@ -118,22 +127,23 @@ fn read_data_stream_id_zero() {
 
 // ===== HEADERS =====
 
-#[test]
+#[runtime::test]
 #[ignore]
-fn read_headers_without_pseudo() {}
+async fn read_headers_without_pseudo() {}
 
-#[test]
+#[runtime::test]
 #[ignore]
-fn read_headers_with_pseudo() {}
+async fn read_headers_with_pseudo() {}
 
-#[test]
+#[runtime::test]
 #[ignore]
-fn read_headers_empty_payload() {}
+async fn read_headers_empty_payload() {}
 
-#[test]
-fn read_continuation_frames() {
+#[runtime::test]
+async fn read_continuation_frames() {
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let large = build_large_headers();
     let frame = large.iter().fold(
@@ -142,7 +152,6 @@ fn read_continuation_frames() {
     ).eos();
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(
             frames::headers(1)
@@ -152,42 +161,41 @@ fn read_continuation_frames() {
         .send_frame(frame)
         .close();
 
-    let client = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, conn)| {
-            let request = Request::builder()
-                .uri("https://http2.akamai.com/")
-                .body(())
-                .unwrap();
+    let client = async {
+        let (mut client, mut conn) = client::handshake(io)
+            .compat()
+            .await
+            .unwrap();
+        let mut conn = conn.compat();
 
-            let req = client
-                .send_request(request, true)
-                .expect("send_request")
-                .0
-                .expect("response")
-                .map(move |res| {
-                    assert_eq!(res.status(), StatusCode::OK);
-                    let (head, _body) = res.into_parts();
-                    let expected = large.iter().fold(HeaderMap::new(), |mut map, &(name, ref value)| {
-                        use h2_support::frames::HttpTryInto;
-                        map.append(name, value.as_str().try_into().unwrap());
-                        map
-                    });
-                    assert_eq!(head.headers, expected);
-                });
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
 
-            conn.drive(req)
-                .and_then(move |(h2, _)| {
-                    h2.expect("client")
-                }).map(|c| (client, c))
+        let (response, _) = client
+            .send_request(request, true)
+            .unwrap();
+        let response = response.compat();
+
+        let res = conn.drive(response).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (head, _body) = res.into_parts();
+        let expected = large.iter().fold(HeaderMap::new(), |mut map, &(name, ref value)| {
+            use h2_support::frames::HttpTryInto;
+            map.append(name, value.as_str().try_into().unwrap());
+            map
         });
+        assert_eq!(head.headers, expected);
 
-    client.join(srv).wait().expect("wait");
+        conn.await;
+    };
 
+    join!(client, srv);
 }
 
-#[test]
-fn update_max_frame_len_at_rest() {
+#[runtime::test]
+async fn update_max_frame_len_at_rest() {
     let _ = env_logger::try_init();
     // TODO: add test for updating max frame length in flight as well?
     let mut codec = raw_codec! {
@@ -201,11 +209,15 @@ fn update_max_frame_len_at_rest() {
 
     assert_eq!(poll_frame!(Data, codec).payload(), &b"hello"[..]);
 
-    codec.set_max_recv_frame_size(16_384);
+    codec.get_mut().set_max_recv_frame_size(16_384);
 
-    assert_eq!(codec.max_recv_frame_size(), 16_384);
+    assert_eq!(codec.get_ref().max_recv_frame_size(), 16_384);
+    let err = codec.next()
+        .await
+        .unwrap()
+        .unwrap_err();
     assert_eq!(
-        codec.poll().unwrap_err().description(),
+        err.description(),
         "frame with invalid size"
     );
 }

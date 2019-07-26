@@ -7,6 +7,7 @@ macro_rules! raw_codec {
             $fn:ident => [$($chunk:expr,)+];
         )*
     ) => {{
+        use futures::compat::*;
         let mut b = $crate::mock_io::Builder::new();
 
         $({
@@ -19,7 +20,7 @@ macro_rules! raw_codec {
             b.$fn(&chunk[..]);
         })*
 
-        $crate::Codec::new(b.build())
+        $crate::Codec::new(b.build().compat()).compat()
     }}
 }
 

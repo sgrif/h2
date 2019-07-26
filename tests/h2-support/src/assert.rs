@@ -2,7 +2,7 @@
 #[macro_export]
 macro_rules! assert_closed {
     ($transport:expr) => {{
-        assert_eq!($transport.poll().unwrap(), None.into());
+        assert!($transport.next().await.is_none());
     }}
 }
 
@@ -49,8 +49,8 @@ macro_rules! assert_settings {
 #[macro_export]
 macro_rules! poll_err {
     ($transport:expr) => {{
-        match $transport.poll() {
-            Err(e) => e,
+        match $transport.next().await {
+            Some(Err(e)) => e,
             frame => panic!("expected error; actual={:?}", frame),
         }
     }}
@@ -60,10 +60,9 @@ macro_rules! poll_err {
 macro_rules! poll_frame {
     ($type: ident, $transport:expr) => {{
         use h2::frame::Frame;
-        use futures::Async;
 
-        match $transport.poll() {
-            Ok(Async::Ready(Some(Frame::$type(frame)))) => frame,
+        match $transport.next().await {
+            Some(Ok(Frame::$type(frame))) => frame,
             frame => panic!("unexpected frame; actual={:?}", frame),
         }
     }}
