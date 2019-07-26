@@ -1,11 +1,18 @@
-use h2_support::prelude::*;
+#![deny(warnings)]
+#![allow(unused_mut)] // FIXME: Remove once std::future port is finished
+#![feature(async_await)]
 
-#[test]
-fn write_continuation_frames() {
+use h2_support::prelude::*;
+use futures::join;
+use futures::compat::*;
+
+#[runtime::test]
+async fn write_continuation_frames() {
     // An invalid dependency ID results in a stream level error. The hpack
     // payload should still be decoded.
     let _ = env_logger::try_init();
     let (io, srv) = mock::new();
+    let io = io.compat();
 
     let large = build_large_headers();
 
@@ -15,7 +22,6 @@ fn write_continuation_frames() {
         |frame, &(name, ref value)| frame.field(name, &value[..]));
 
     let srv = srv.assert_client_handshake()
-        .unwrap()
         .recv_settings()
         .recv_frame(frame.eos())
         .send_frame(
@@ -25,37 +31,34 @@ fn write_continuation_frames() {
         )
         .close();
 
-    let client = client::handshake(io)
-        .expect("handshake")
-        .and_then(|(mut client, conn)| {
-            let mut request = Request::builder();
-            request.uri("https://http2.akamai.com/");
+    let client = async {
+        let (mut client, mut conn) = client::handshake(io)
+            .compat()
+            .await
+            .unwrap();
+        let mut conn = conn.compat();
 
-            for &(name, ref value) in &large {
-                request.header(name, &value[..]);
-            }
+        let mut request = Request::builder();
+        request.uri("https://http2.akamai.com/");
 
-            let request = request
-                .body(())
-                .unwrap();
+        for &(name, ref value) in &large {
+            request.header(name, &value[..]);
+        }
 
-            let req = client
-                .send_request(request, true)
-                .expect("send_request1")
-                .0
-                .then(|res| {
-                    let response = res.unwrap();
-                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-                    Ok::<_, ()>(())
-                });
+        let request = request
+            .body(())
+            .unwrap();
 
-            conn.drive(req)
-                .and_then(move |(h2, _)| {
-                    h2.unwrap()
-                }).map(|c| {
-                    (c, client)
-                })
-        });
+        let (response, _) = client
+            .send_request(request, true)
+            .unwrap();
+        let response = response.compat();
 
-    client.join(srv).wait().expect("wait");
+        let response = conn.drive(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        conn.await.unwrap();
+    };
+
+    join!(client, srv);
 }

@@ -188,7 +188,7 @@ async fn read_continuation_frames() {
         });
         assert_eq!(head.headers, expected);
 
-        conn.await;
+        conn.await.unwrap();
     };
 
     join!(client, srv);
