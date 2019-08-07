@@ -215,8 +215,16 @@ pub struct Pong {
 }
 
 /// Future for [`SendStream::reset`]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Reset<'a, B: IntoBuf> {
     send_stream: &'a mut SendStream<B>,
+}
+
+/// Future for [`RecvStream::trailers`]
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Trailers<'a> {
+    recv_stream: &'a mut RecvStream,
 }
 
 // ===== impl SendStream =====
@@ -435,6 +443,13 @@ impl RecvStream {
         self.inner.inner.poll_trailers().map_err(Into::into)
     }
 
+    /// Returns a future that resolves with received trailers.
+    pub fn trailers(&mut self) -> Trailers<'_> {
+        Trailers {
+            recv_stream: self,
+        }
+    }
+
     /// Returns the stream ID of this stream.
     ///
     /// # Panics
@@ -633,7 +648,7 @@ impl fmt::Debug for Pong {
 
 // ===== impl Reset =====
 
-impl<'a, B> fmt::Debug for Reset<'a, B>
+impl<B> fmt::Debug for Reset<'_, B>
 where
     B: IntoBuf,
     SendStream<B>: fmt::Debug,
@@ -645,11 +660,22 @@ where
     }
 }
 
-impl<'a, B: IntoBuf> Future for Reset<'a, B> {
+impl<B: IntoBuf> Future for Reset<'_, B> {
     type Item = Reason;
     type Error = crate::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.send_stream.poll_reset()
+    }
+}
+
+// ===== impl Trailers =====
+
+impl Future for Trailers<'_> {
+    type Item = Option<HeaderMap>;
+    type Error = crate::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.recv_stream.poll_trailers()
     }
 }
