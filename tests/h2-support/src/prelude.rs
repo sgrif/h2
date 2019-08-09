@@ -68,36 +68,6 @@ impl MockH2 for super::mock_io::Builder {
     }
 }
 
-pub trait ClientExt {
-    fn run<F: Future + Unpin>(&mut self, f: F) -> F::Output;
-}
-
-impl<T, B> ClientExt for client::Connection<T, B>
-where
-    T: AsyncRead + AsyncWrite + 'static,
-    B: IntoBuf + 'static,
-{
-    // FIXME: There must be a proper way to do this...
-    fn run<F: Future + Unpin>(&mut self, f: F) -> F::Output {
-        use futures01::Future;
-        use futures::executor::block_on;
-        use futures::select;
-
-        let mut connection_future = future::poll_fn(|_| {
-            util::poll_01_to_03(self.poll())
-        }).fuse();
-        let mut f = f.fuse();
-        block_on(async {
-            loop {
-                select! {
-                    conn_res = connection_future => conn_res.unwrap(),
-                    v = f => break v,
-                }
-            }
-        })
-    }
-}
-
 pub fn build_large_headers() -> Vec<(&'static str, String)> {
     vec![
         ("one", "hello".to_string()),

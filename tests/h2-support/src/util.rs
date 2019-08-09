@@ -11,8 +11,20 @@ pub fn byte_str(s: &str) -> String<Bytes> {
     String::try_from(Bytes::from(s)).unwrap()
 }
 
-pub async fn yield_once() {
-    futures::pending!();
+pub async fn idle_ms(ms: usize) {
+    use futures::channel::oneshot;
+    use std::thread;
+    use std::time::Duration;
+
+    // This is terrible... but oh well
+    let (tx, rx) = oneshot::channel();
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(ms as u64));
+        tx.send(()).unwrap();
+    });
+
+    rx.await.unwrap();
 }
 
 pub fn wait_for_capacity(stream: h2::SendStream<Bytes>, target: usize) -> WaitForCapacity {

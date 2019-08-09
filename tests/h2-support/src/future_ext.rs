@@ -78,7 +78,10 @@ pub trait FutureExt: Future {
     where
         Self: Future + Sized + 'static,
     {
-        Box::new(super::util::yield_once().then(move |_| self))
+        Box::new(async move {
+            futures::pending!();
+            self.await
+        })
     }
 }
 
